@@ -1,6 +1,8 @@
 # !pip install xgboost==2.0.3 pandas numpy==1.26.4 scipy==1.13.1 joblib matplotlib scikit-learn==1.2.2 --no-deps
 
 import os
+import sys
+import contextlib
 import json
 import time
 import math
@@ -29,10 +31,32 @@ from xgboost import XGBClassifier, cv as xgb_cv, DMatrix
 import joblib
 from scipy.stats import ks_2samp
 
+# Optional resampling (imbalanced-learn)
+try:
+    from imblearn.over_sampling import BorderlineSMOTE
+    from imblearn.under_sampling import EditedNearestNeighbours
+    HAS_IMBLEARN = True
+except Exception:
+    HAS_IMBLEARN = False
+    print("[WARN] imbalanced-learn not installed. Install with pip install imbalanced-learn to enable resampling.")
+
 os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'  # Sử dụng GPU nếu có
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # Utilities & Metrics
+@contextlib.contextmanager
+def _suppress_stderr():
+    saved_stderr = sys.stderr
+    try:
+        sys.stderr = open(os.devnull, "w")
+        yield
+    finally:
+        try:
+            sys.stderr.close()
+        except Exception:
+            pass
+        sys.stderr = saved_stderr
+
 def ensure_outputs_dir(path: str = "outputs"):
     os.makedirs(path, exist_ok=True)
     return path
@@ -264,13 +288,96 @@ def compute_scale_pos_weight(y: pd.Series) -> float:
     neg = len(y) - pos
     return max(1.0, neg / max(1, pos))
 
+# Resampling helper (borrowed idea from model_v2)
+def _apply_resampling(
+    X: pd.DataFrame,
+    y: pd.Series,
+    method: int = 0,
+    ratio: float = 0.1,
+    k_neighbors: int = 5,
+    target_fraud_share: float = None,
+) -> Tuple[pd.DataFrame, pd.Series]:
+    """
+    method:
+      0 = none
+      1 = BorderlineSMOTE oversampling
+      2 = BorderlineSMOTE + EditedNearestNeighbours (cleaning)
+    ratio: target minority/majority sampling_strategy for oversampling
+    """
+    if method == 0 or not HAS_IMBLEARN:
+        if method != 0 and not HAS_IMBLEARN:
+            print("[WARN] imbalanced-learn missing; skipping resampling.")
+        return X, y
+
+    # Constrain ratio and neighbors to conservative ranges to avoid overfitting
+    if target_fraud_share is not None:
+        # Convert target share p to sampling_strategy r = p/(1-p)
+        ratio = float(target_fraud_share / max(1e-9, (1.0 - target_fraud_share)))
+    ratio = float(max(0.05, min(0.12, ratio)))
+    k_neighbors = int(max(5, min(15, k_neighbors)))
+
+    try:
+        n0 = len(X)
+        pos0 = int(y.sum())
+        rate0 = (pos0 / n0) if n0 > 0 else 0.0
+        print(f"[INFO] Before resampling: n={n0}, fraud={pos0} ({rate0*100:.4f}%)")
+        if target_fraud_share is not None:
+            print(f"[INFO] Requested target fraud share: {target_fraud_share*100:.2f}% -> sampling_strategy={ratio:.4f}")
+        sm = BorderlineSMOTE(sampling_strategy=ratio, k_neighbors=k_neighbors, random_state=42)
+        with _suppress_stderr():
+            X_res, y_res = sm.fit_resample(X, y)
+            if method == 2:
+                enn = EditedNearestNeighbours(n_neighbors=3, kind_sel="all", n_jobs=1)
+                X_res, y_res = enn.fit_resample(X_res, y_res)
+        n1 = len(X_res)
+        pos1 = int(y_res.sum())
+        rate1 = (pos1 / n1) if n1 > 0 else 0.0
+        print(f"[INFO] Resampling applied: method={method}, ratio={ratio}, k={k_neighbors} | {n0} -> {n1}")
+        print(f"[INFO] After resampling: n={n1}, fraud={pos1} ({rate1*100:.4f}%)")
+        if target_fraud_share is not None:
+            status = "OK" if abs(rate1 - target_fraud_share) <= 0.01 else "OFF-TARGET"
+            print(f"[INFO] Target check: achieved ~{rate1*100:.2f}% vs target {target_fraud_share*100:.2f}% -> {status}")
+        return X_res, y_res
+    except Exception as e:
+        print(f"[WARN] Resampling failed ({e}); continuing without resampling.")
+        return X, y
+
 # XGBoost Training (Pure)
-def train_pure_xgb(X_tr, y_tr, X_va, y_va, X_te, y_te, seed=42, out_dir: str = "outputs"):
+def train_pure_xgb(
+    X_tr,
+    y_tr,
+    X_va,
+    y_va,
+    X_te,
+    y_te,
+    seed=42,
+    out_dir: str = "outputs",
+    resample_method: int = 0,
+    resample_ratio: float = 0.1,
+    resample_k: int = 5,
+    resample_target_fraud: float = None,
+):
     ensure_outputs_dir(out_dir)
     start = time.time()
-    
-    # Tính scale_pos_weight
-    spw = compute_scale_pos_weight(y_tr)
+
+    print(
+        f"[INFO] Resampling config -> method={resample_method}, "
+        f"ratio={resample_ratio}, k={resample_k}, target_fraud={resample_target_fraud}"
+    )
+    base_rate = float(y_tr.mean()) if len(y_tr) > 0 else 0.0
+    print(f"[INFO] Train baseline fraud rate: {base_rate*100:.4f}% ({int(y_tr.sum())}/{len(y_tr)})")
+
+    # Optional resampling on training set only (to avoid leakage)
+    X_tr_use, y_tr_use = _apply_resampling(
+        X_tr, y_tr,
+        resample_method,
+        resample_ratio,
+        resample_k,
+        target_fraud_share=resample_target_fraud,
+    )
+
+    # Tính scale_pos_weight theo dữ liệu train (sau resampling nếu có)
+    spw = compute_scale_pos_weight(y_tr_use)
     
     # Tham số XGBoost cơ bản (pure, không tối ưu hóa)
     base_params = {
@@ -291,21 +398,25 @@ def train_pure_xgb(X_tr, y_tr, X_va, y_va, X_te, y_te, seed=42, out_dir: str = "
     
     # Cross-validation để tìm n_estimators
     try:
-        dtrain = DMatrix(X_tr, label=y_tr)
-        tscv = TimeSeriesSplit(n_splits=5, test_size=len(X_tr)//5)
-        res = xgb_cv(
-            params=base_params,
-            dtrain=dtrain,
-            num_boost_round=800,
-            folds=tscv.split(X_tr, y_tr),
-            metrics=("aucpr", "logloss"),
-            early_stopping_rounds=50,
-            seed=seed,
-            as_pandas=True,
-            verbose_eval=False,
-        )
-        best_nrounds = len(res)
-        print(f"[INFO] XGB CV chose {best_nrounds} rounds.")
+        if resample_method == 0:
+            dtrain = DMatrix(X_tr_use, label=y_tr_use)
+            tscv = TimeSeriesSplit(n_splits=5, test_size=len(X_tr)//5)
+            res = xgb_cv(
+                params=base_params,
+                dtrain=dtrain,
+                num_boost_round=800,
+                folds=tscv.split(X_tr, y_tr),
+                metrics=("aucpr", "logloss"),
+                early_stopping_rounds=50,
+                seed=seed,
+                as_pandas=True,
+                verbose_eval=False,
+            )
+            best_nrounds = len(res)
+            print(f"[INFO] XGB CV chose {best_nrounds} rounds.")
+        else:
+            print("[INFO] Skipping CV due to resampling; using default n_estimators 400")
+            best_nrounds = 400
     except Exception as e:
         print(f"[WARN] xgb cv failed: {e}; using default n_estimators 400")
         best_nrounds = 400
@@ -321,7 +432,7 @@ def train_pure_xgb(X_tr, y_tr, X_va, y_va, X_te, y_te, seed=42, out_dir: str = "
     
     try:
         clf.fit(
-            X_tr, y_tr,
+            X_tr_use, y_tr_use,
             eval_set=[(X_va, y_va)],
             verbose=False,
             early_stopping_rounds=50
@@ -332,7 +443,7 @@ def train_pure_xgb(X_tr, y_tr, X_va, y_va, X_te, y_te, seed=42, out_dir: str = "
     except Exception as e:
         print(f"[WARN] GPU training failed: {e}. Falling back to CPU.")
         clf.tree_method = "hist"
-        clf.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False, early_stopping_rounds=50)
+        clf.fit(X_tr_use, y_tr_use, eval_set=[(X_va, y_va)], verbose=False, early_stopping_rounds=50)
         evals_result = clf.evals_result()
         joblib.dump(clf, model_checkpoint_path)
     
@@ -358,7 +469,22 @@ def train_pure_xgb(X_tr, y_tr, X_va, y_va, X_te, y_te, seed=42, out_dir: str = "
     except Exception as e:
         print(f"[WARN] Plotting failed: {e}")
     
-    return {"model": clf, "metrics": metrics, "val_pr_auc": float(average_precision_score(y_va, proba_val)), "evals_result": evals_result}
+    return {
+        "model": clf,
+        "metrics": metrics,
+        "val_pr_auc": float(average_precision_score(y_va, proba_val)),
+        "evals_result": evals_result,
+        "resampling": {
+            "method": resample_method,
+            "ratio": resample_ratio,
+            "k_neighbors": resample_k,
+            "target_fraud_share": resample_target_fraud,
+            "fraud_rate_before": float(y_tr.mean()),
+            "fraud_rate_after": float(y_tr_use.mean()),
+            "train_size_before": int(len(X_tr)),
+            "train_size_after": int(len(X_tr_use)),
+        },
+    }
 
 # Main Runner
 def run_experiments(
@@ -367,6 +493,10 @@ def run_experiments(
     seed: int = 42,
     embargo: int = 0,
     out_dir: str = "outputs",
+    resample_method: int = 0,
+    resample_ratio: float = 0.1,
+    resample_k: int = 5,
+    resample_target_fraud: float = None,
 ):
     features = features or DEFAULT_FEATURES
     X, y = load_dataset(data_path, features)
@@ -377,9 +507,24 @@ def run_experiments(
     
     results = {}
     start = time.time()
-    out = train_pure_xgb(X_tr.copy(), y_tr.copy(), X_va.copy(), y_va.copy(), X_te.copy(), y_te.copy(), seed, out_dir=out_dir)
+    out = train_pure_xgb(
+        X_tr.copy(), y_tr.copy(),
+        X_va.copy(), y_va.copy(),
+        X_te.copy(), y_te.copy(),
+        seed,
+        out_dir=out_dir,
+        resample_method=resample_method,
+        resample_ratio=resample_ratio,
+        resample_k=resample_k,
+        resample_target_fraud=resample_target_fraud,
+    )
     duration = round(time.time() - start, 2)
-    res = {"metrics": out["metrics"], "val_pr_auc": out.get("val_pr_auc", None), "time_sec": duration}
+    res = {
+        "metrics": out["metrics"],
+        "val_pr_auc": out.get("val_pr_auc", None),
+        "time_sec": duration,
+        "resampling": out.get("resampling", {}),
+    }
     results["pure_xgb"] = res
     print(f"Pure XGBoost done in {duration}s | Test PR-AUC: {res['metrics']['pr_auc']:.5f} | ROC-AUC: {res['metrics']['roc_auc']:.5f}")
     
@@ -389,13 +534,17 @@ def run_experiments(
         json.dump(results, f, indent=2)
     print(f"Saved results to {out_file}")
 
-def parse_args():
+def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Pure XGBoost for Fraud Detection")
     p.add_argument("--data", type=str, default="/kaggle/input/creditcardfraud/creditcard.csv", help="Path to dataset CSV")
     p.add_argument("--embargo", type=int, default=0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out", type=str, default="outputs")
-    args = p.parse_args([])
+    p.add_argument("--resample-method", type=int, default=2, choices=[0,1,2], help="0: none, 1: BorderlineSMOTE, 2: BorderlineSMOTE+ENN")
+    p.add_argument("--resample-ratio", type=float, default=0.1, help="Target minority/majority ratio for oversampling (0.05-0.12 clamped)")
+    p.add_argument("--resample-k", type=int, default=7, help="k_neighbors for BorderlineSMOTE (5-15 clamped)")
+    p.add_argument("--resample-target-fraud", type=float, default=0.10, help="Desired fraud share after resampling (e.g., 0.10 = 10%). Overrides --resample-ratio.")
+    args, _ = p.parse_known_args(argv)
     return args
 
 if __name__ == "__main__":
@@ -406,6 +555,10 @@ if __name__ == "__main__":
             seed=args.seed,
             embargo=args.embargo,
             out_dir=args.out,
+            resample_method=args.resample_method,
+            resample_ratio=args.resample_ratio,
+            resample_k=args.resample_k,
+            resample_target_fraud=args.resample_target_fraud,
         )
         print("\nHOÀN THÀNH! Kiểm tra thư mục outputs để xem kết quả.")
     except Exception as e:
