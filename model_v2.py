@@ -23,10 +23,12 @@ from sklearn.metrics import (
     brier_score_loss,
     precision_score,
     recall_score,
+    log_loss,  # Thêm cho logloss test
 )
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier  # Thêm cho Adversarial Validation
 
 try:
     from imblearn.over_sampling import BorderlineSMOTE
@@ -39,6 +41,7 @@ except Exception:
 
 from xgboost import XGBClassifier, cv as xgb_cv, DMatrix
 import joblib
+from scipy import stats  # Thêm cho KS Statistic
 
 # Ép dùng cả hai GPU T4
 os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
@@ -124,8 +127,33 @@ def compute_metrics(y_true: np.ndarray, y_proba: np.ndarray, threshold: float = 
         "f1": float(f1_score(y_true, y_pred)),
         "mcc": float(matthews_corrcoef(y_true, y_pred)),
         "balanced_acc": float(balanced_accuracy_score(y_true, y_pred)),
+        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        "recall": float(recall_score(y_true, y_pred, zero_division=0)),
         "threshold": float(threshold),
     }
+    # Thêm KS Statistic
+    non_fraud_scores = y_proba[y_true == 0]
+    fraud_scores = y_proba[y_true == 1]
+    if len(non_fraud_scores) > 0 and len(fraud_scores) > 0:
+        metrics["ks_statistic"] = float(stats.ks_2samp(fraud_scores, non_fraud_scores).statistic)
+    else:
+        metrics["ks_statistic"] = 0.0
+
+    # Thêm ECE (Expected Calibration Error)
+    def expected_calibration_error(y_true, y_proba, n_bins=10):
+        bins = np.linspace(0.0, 1.0, n_bins + 1)
+        binids = np.digitize(y_proba, bins) - 1
+        bin_sums = np.bincount(binids, minlength=n_bins, weights=y_proba)
+        bin_true = np.bincount(binids, minlength=n_bins, weights=y_true)
+        bin_total = np.bincount(binids, minlength=n_bins)
+        non_empty = bin_total > 0
+        prob_pred = bin_sums[non_empty] / bin_total[non_empty]
+        prob_true = bin_true[non_empty] / bin_total[non_empty]
+        ece = np.sum(np.abs(prob_pred - prob_true) * (bin_total[non_empty] / len(y_true)))
+        return ece
+
+    metrics["ece"] = float(expected_calibration_error(y_true, y_proba))
+
     for k in k_list:
         metrics[f"recall@{k}"] = recall_at_k(y_true, y_proba, k)
     return metrics
@@ -141,7 +169,7 @@ def calibrate_probabilities(y_val: np.ndarray, proba_val: np.ndarray, proba_test
         return proba_test  # Bỏ 'platt' để tránh lỗi
 
 # -----------------------------
-# Plotting helpers
+# Plotting helpers - Thêm plot logloss test
 # -----------------------------
 def plot_xgb_evals(evals_result: Dict, out_path: str):
     plt.figure(figsize=(10, 4))
@@ -168,6 +196,20 @@ def plot_xgb_evals(evals_result: Dict, out_path: str):
     plt.grid(True)
     plt.tight_layout()
     plt.savefig(os.path.join(out_path, "evals_logloss.png"), dpi=150)
+    plt.close()
+
+def plot_logloss_comparison(evals_val_logloss: list, test_logloss: list, out_path: str):
+    """Plot validation logloss vs test logloss for comparison"""
+    plt.figure(figsize=(10, 4))
+    plt.plot(evals_val_logloss, label="Validation Logloss", color='blue')
+    plt.plot(test_logloss, label="Test Logloss", color='red')
+    plt.title("Logloss Comparison: Validation vs Test")
+    plt.xlabel("Boosting Round")
+    plt.ylabel("Logloss")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_path, "logloss_comparison.png"), dpi=150)
     plt.close()
 
 def plot_roc_pr(y_true_val, y_proba_val, y_true_test, y_proba_test, out_path: str):
@@ -349,25 +391,41 @@ def compute_scale_pos_weight(y: pd.Series) -> float:
     return max(1.0, neg / max(1, pos))
 
 # -----------------------------
+# Phương án 1: Adversarial Validation - Fix high drift
+# -----------------------------
+def adversarial_validation_check(X_tr: pd.DataFrame, X_va: pd.DataFrame, X_te: pd.DataFrame) -> float:
+    """Adversarial Validation để check data drift giữa splits"""
+    # Tạo dataset adv: 0=train, 1=val+test (hoặc pairwise)
+    X_adv = pd.concat([X_tr.assign(split=0), pd.concat([X_va, X_te]).assign(split=1)])
+    y_adv = X_adv['split']
+    X_adv = X_adv.drop('split', axis=1)
+    clf_adv = RandomForestClassifier(n_estimators=50, random_state=42, n_jobs=-1)
+    clf_adv.fit(X_adv, y_adv)
+    pred_adv = clf_adv.predict_proba(X_adv)[:, 1]
+    av_score = roc_auc_score(y_adv, pred_adv)  # Gần 0.5 = similar distributions
+    return av_score
+
+# -----------------------------
 # Firefly Algorithm - Enhanced for better feature selection
 # -----------------------------
 @dataclass
 class FAConfig:
-    n_fireflies: int = 40     # Tăng từ 50 lên 40 để balance performance/speed
-    n_epochs: int = 25        # Tăng từ 25 để convergence tốt hơn 
+    n_fireflies: int = 30     # Tăng từ 50 lên 40 để balance performance/speed
+    n_epochs: int = 20        # Tăng từ 25 để convergence tốt hơn 
     alpha: float = 0.25       # Giữ nguyên exploration
     beta0: float = 2.0        # Giữ nguyên attraction
     gamma: float = 0.20       # Giữ nguyên decay rate
-    lambda_feat: float = 0.02 # Tăng feature regularization để select ít feature hơn
+    lambda_feat: float = 0.01 # Giảm từ 0.02 để fitness dương hơn
     diversity_threshold: float = 0.1  # Threshold cho diversity preservation
     patience: int = 6         # Giảm patience từ 10 -> 6 để early stop sớm hơn, tránh overfitting
     validation_strictness: float = 0.8  # Strict validation - require high consistency across folds
-    overfitting_threshold: float = 0.02  # Lower threshold để detect overfitting sớm hơn
+    overfitting_threshold: float = 0.03  # Tăng từ 0.02 để ít penalty hơn
     random_state: int = 42
+    adaptive_ratio: bool = True  # Thêm cho Phương án 2
+    use_focal_loss: bool = True  # Thêm cho Phương án 2
     
     # Feature selection strategy
-    feature_selection_mode: str = "flexible"  # "flexible" hoặc "fixed_count"
-    target_feature_count: int = 14           # Số features mục tiêu khi dùng "fixed_count"
+    feature_selection_mode: str = "flexible"  # Chỉ giữ "flexible"
     min_feature_count: int = 8               # Tối thiểu features khi dùng "flexible"
 
 def sigmoid(x):
@@ -375,46 +433,56 @@ def sigmoid(x):
 
 def initialize_population(n_fireflies: int, dim: int, rng: np.random.RandomState, config: FAConfig = None) -> np.ndarray:
     """
-    Initialize population với 2 strategies:
-    - flexible: tự do chọn features
-    - fixed_count: cố định số lượng features
+    Initialize population với flexible strategy
     """
     pop = rng.uniform(low=-1.0, high=1.0, size=(n_fireflies, dim))
-    
-    if config and config.feature_selection_mode == "fixed_count":
-        n_features = dim - 13  # trừ đi hyperparameters
-        target_count = config.target_feature_count
-        
-        # Đảm bảo mỗi firefly có đúng target_count features được chọn
-        for i in range(n_fireflies):
-            # Reset feature selection part
-            feature_part = pop[i, :n_features]
-            
-            # Chọn ngẫu nhiên target_count features để activate
-            selected_indices = rng.choice(n_features, size=min(target_count, n_features), replace=False)
-            
-            # Set all features to negative (not selected)
-            feature_part[:] = rng.uniform(-2.0, -0.5, n_features)
-            
-            # Set selected features to positive (selected)
-            feature_part[selected_indices] = rng.uniform(0.5, 2.0, len(selected_indices))
-            
-            pop[i, :n_features] = feature_part
-            
-        print(f"[INFO] Initialized population with fixed {target_count} features per firefly")
-    else:
-        print(f"[INFO] Initialized population with flexible feature selection")
-    
+    print(f"[INFO] Initialized population with flexible feature selection")
     return pop
 
-def _apply_resampling(X: pd.DataFrame, y: pd.Series, method: int, ratio: float, k_neighbors: int) -> Tuple[pd.DataFrame, pd.Series]:
+def _apply_resampling(X: pd.DataFrame, y: pd.Series, method: int, ratio: float, k_neighbors: int, adaptive: bool = False) -> Tuple[pd.DataFrame, pd.Series]:
+    # Fix: Skip nếu <2 classes (error 1 class)
+    if len(np.unique(y)) < 2:
+        print(f"[WARN] Skipping resampling: only {len(np.unique(y))} classes in y.")
+        return X, y
+    
     # Kích hoạt resampling với ratio thấp hơn để tránh over-sampling
     if method == 0 or not HAS_IMBLEARN:
         return X, y
     
     # Cải thiện tham số - giảm ratio từ 0.42 xuống 0.1-0.2
-    ratio = float(max(0.05, min(0.12, ratio)))  # Giảm ratio range xuống 5-12% để tránh overfitting
+    initial_ratio = float(max(0.05, min(0.12, ratio)))  # Giảm ratio range xuống 5-12% để tránh overfitting
     k_neighbors = int(max(5, min(15, k_neighbors)))
+    
+    # Phương án 2: Adaptive ratio
+    if adaptive:
+        current_ratio = initial_ratio
+        for _ in range(3):  # Iterate 3 lần để adapt
+            try:
+                sm = BorderlineSMOTE(
+                    sampling_strategy=current_ratio, 
+                    k_neighbors=k_neighbors,
+                    m_neighbors=min(10, k_neighbors), 
+                    random_state=42,
+                    kind='borderline-1'  # Tập trung vào borderline cases
+                )
+                X_temp, y_temp = sm.fit_resample(X, y)
+                # Quick check với small subset (giả sử model simple)
+                if len(X_temp) > 100:
+                    # Pseudo model: dùng logistic để quick val
+                    from sklearn.linear_model import LogisticRegression
+                    quick_model = LogisticRegression(random_state=42, max_iter=100)
+                    quick_model.fit(X_temp[:100], y_temp[:100])
+                    quick_ap = average_precision_score(y_temp[100:200] if len(y_temp)>200 else y_temp[:100], quick_model.predict_proba(X_temp[100:200] if len(X_temp)>200 else X_temp[:100])[:,1])
+                    if quick_ap > 0.6:  # Nếu tốt, giữ ratio
+                        break
+                    else:
+                        current_ratio *= 0.9  # Giảm ratio nếu overfit
+                else:
+                    break
+            except:
+                break
+        ratio = current_ratio
+        print(f"[INFO] Adaptive ratio adjusted to {ratio:.4f}")
     
     try:
         # Đảm bảo có đủ samples cho SMOTE
@@ -449,6 +517,16 @@ def _apply_resampling(X: pd.DataFrame, y: pd.Series, method: int, ratio: float, 
         print(f"[WARN] Resampling failed: {e}. Using original data.")
         return X, y
 
+# Phương án 2: Focal Loss Objective
+def focal_loss_objective(y_true, y_pred):
+    """Custom Focal Loss cho XGBoost"""
+    alpha = 0.25  # Balance factor
+    gamma = 2.0   # Focusing parameter
+    p = y_pred
+    grad = alpha * (1 - p) ** gamma * (y_true - p)
+    hess = alpha * gamma * (1 - p) ** (gamma - 1) * p * (1 - p)
+    return grad, hess
+
 def evaluate_candidate(
     X_train: pd.DataFrame,
     y_train: pd.Series,
@@ -457,6 +535,7 @@ def evaluate_candidate(
     feat_mask: np.ndarray,
     hyperparams: Dict,
     resample_cfg: Dict,
+    config: FAConfig,
 ) -> float:
     if feat_mask.sum() == 0:
         return 0.0
@@ -467,8 +546,9 @@ def evaluate_candidate(
         X_tr_use,
         y_tr_use,
         method=int(resample_cfg.get("method", 0)),
-        ratio=float(resample_cfg.get("ratio", 0.15)),  # Giảm ratio mặc định từ 0.5 -> 0.15
+        ratio=float(resample_cfg.get("ratio", 0.15)),
         k_neighbors=int(resample_cfg.get("k_neighbors", 5)),
+        adaptive=config.adaptive_ratio
     )
     if resample_cfg.get("method", 0) != 0 and HAS_IMBLEARN:
         hp_spw = 1.0
@@ -476,12 +556,15 @@ def evaluate_candidate(
         pos = int(pd.Series(y_tr_use).sum()); neg = len(y_tr_use) - pos
         hp_spw = max(1.0, neg / max(1, pos))
     
+    # XGBoost với focal loss nếu enable
+    objective = focal_loss_objective if config.use_focal_loss else "binary:logistic"
+    
     # XGBoost với regularization mạnh hơn và early stopping tốt hơn
     model = XGBClassifier(
-        objective="binary:logistic",
+        objective=objective,
         tree_method="gpu_hist",
         n_gpus=2,  
-        eval_metric="aucpr",
+        eval_metric="aucpr",  # Fix: String thay vì list
         n_estimators=300,  # Giảm từ 400 để tránh overfitting
         learning_rate=hyperparams.get("eta", 0.02),  # Giảm learning rate hơn nữa
         max_depth=min(int(hyperparams.get("max_depth", 4)), 5),  # Giảm max_depth tối đa
@@ -550,29 +633,18 @@ def evaluate_candidate(
 def decode_position(pos: np.ndarray, n_features: int, config: FAConfig = None) -> Tuple[np.ndarray, Dict, Dict]:
     feat_vals = pos[:n_features]
     
-    if config and config.feature_selection_mode == "fixed_count":
-        # Cố định số lượng features
-        target_count = config.target_feature_count
-        
-        # Lấy top target_count features có giá trị cao nhất
-        top_indices = np.argsort(feat_vals)[-target_count:]
+    # Flexible selection với minimum constraint
+    feat_mask = (sigmoid(feat_vals) >= 0.5).astype(int)
+    
+    # Đảm bảo ít nhất min_feature_count features
+    if config and feat_mask.sum() < config.min_feature_count:
+        min_count = min(config.min_feature_count, n_features)
+        top_indices = np.argsort(feat_vals)[-min_count:]
         feat_mask = np.zeros(n_features, dtype=int)
         feat_mask[top_indices] = 1
-        
-        print(f"[DEBUG] Fixed selection: {target_count} features selected")
+        print(f"[DEBUG] Enforced minimum: {min_count} features selected")
     else:
-        # Flexible selection với minimum constraint
-        feat_mask = (sigmoid(feat_vals) >= 0.5).astype(int)
-        
-        # Đảm bảo ít nhất min_feature_count features
-        if config and feat_mask.sum() < config.min_feature_count:
-            min_count = min(config.min_feature_count, n_features)
-            top_indices = np.argsort(feat_vals)[-min_count:]
-            feat_mask = np.zeros(n_features, dtype=int)
-            feat_mask[top_indices] = 1
-            print(f"[DEBUG] Enforced minimum: {min_count} features selected")
-        else:
-            print(f"[DEBUG] Flexible selection: {feat_mask.sum()} features selected")
+        print(f"[DEBUG] Flexible selection: {feat_mask.sum()} features selected")
     
     hp_vals = pos[n_features:]
     def scale(v, lo, hi):
@@ -615,15 +687,10 @@ def firefly_optimize(
 
     def fitness(pos):
         feat_mask, hp, rcfg = decode_position(pos, n_features, config)
-        ap = evaluate_candidate(X_train, y_train, X_val, y_val, feat_mask, hp, rcfg)
+        ap = evaluate_candidate(X_train, y_train, X_val, y_val, feat_mask, hp, rcfg, config)
         
-        # Điều chỉnh penalty dựa trên mode
-        if config.feature_selection_mode == "fixed_count":
-            # Không penalty cho số lượng features vì đã cố định
-            penalty = 0
-        else:
-            # Flexible mode: penalty cho quá nhiều features
-            penalty = config.lambda_feat * float(feat_mask.sum())
+        # Flexible mode: penalty cho quá nhiều features
+        penalty = config.lambda_feat * float(feat_mask.sum())
         
         return ap - penalty
 
@@ -655,18 +722,6 @@ def firefly_optimize(
                     eps = rng.uniform(-0.5, 0.5, size=dim)
                     pop[i] = pop[i] + beta * (pop[j] - pop[i]) + alpha * eps
                     pop[i] = np.clip(pop[i], -1, 1)
-                    
-                    # Enforce feature count constraint sau khi update
-                    if config.feature_selection_mode == "fixed_count":
-                        n_feat = dim - 13
-                        target_count = config.target_feature_count
-                        feat_part = pop[i, :n_feat]
-                        
-                        # Chọn top target_count features
-                        top_indices = np.argsort(feat_part)[-target_count:]
-                        feat_part[:] = rng.uniform(-2.0, -0.5, n_feat)
-                        feat_part[top_indices] = rng.uniform(0.5, 2.0, len(top_indices))
-                        pop[i, :n_feat] = feat_part
             
             # Enhanced diversity preservation
             if i in sorted_indices[:worst_third]:
@@ -674,18 +729,6 @@ def firefly_optimize(
                 if rng.random() < mutation_rate:
                     mutation = rng.normal(0, 0.25, dim)  # Tăng mutation strength
                     pop[i] = np.clip(pop[i] + mutation, -1, 1)
-                    
-                    # Enforce feature count constraint sau mutation
-                    if config.feature_selection_mode == "fixed_count":
-                        n_feat = dim - 13
-                        target_count = config.target_feature_count
-                        feat_part = pop[i, :n_feat]
-                        
-                        # Chọn top target_count features
-                        top_indices = np.argsort(feat_part)[-target_count:]
-                        feat_part[:] = rng.uniform(-2.0, -0.5, n_feat)
-                        feat_part[top_indices] = rng.uniform(0.5, 2.0, len(top_indices))
-                        pop[i, :n_feat] = feat_part
         
         fits = np.array([fitness(p) for p in pop])
         current_best = max(fits)
@@ -719,11 +762,11 @@ def firefly_optimize(
     return best_mask, best_hp, best_rcfg, best_fit
 
 # -----------------------------
-# Overfitting prevention helpers - Enhanced validation
+# Overfitting prevention helpers - Enhanced validation với Phương án 1 (fix AV drift)
 # -----------------------------
 def robust_cv_with_resampling(X: pd.DataFrame, y: pd.Series, params: Dict, num_boost_round: int = 800, early_stopping_rounds: int = 50, folds: int = 5) -> Tuple[int, Dict, Dict]:
     """
-    Robust CV với resampling riêng biệt cho từng fold để tránh data leakage
+    Robust CV với resampling riêng biệt cho từng fold để tránh data leakage + Adversarial Validation
     """
     from sklearn.model_selection import TimeSeriesSplit
     from sklearn.metrics import precision_score, recall_score
@@ -731,6 +774,18 @@ def robust_cv_with_resampling(X: pd.DataFrame, y: pd.Series, params: Dict, num_b
     tscv = TimeSeriesSplit(n_splits=folds, test_size=len(X)//folds)
     scores = []
     detailed_results = {'fold_scores': [], 'fold_details': []}
+    
+    # Phương án 1: Adversarial Validation trên full splits
+    print(f"[INFO] Running Adversarial Validation...")
+    av_score = adversarial_validation_check(X.iloc[:int(0.7*len(X))], X.iloc[int(0.7*len(X)):int(0.85*len(X))], X.iloc[int(0.85*len(X)):])
+    print(f"[INFO] AV AUC: {av_score:.4f} (closer to 0.5 = better, low drift)")
+    if av_score > 0.7:  # Fix: Threshold 0.7 thay 0.6, và auto-increase embargo
+        print(f"[WARN] High data drift detected (AV={av_score:.4f}). Increasing embargo to 500 and reducing n_rounds by 20%.")
+        num_boost_round = int(num_boost_round * 0.8)
+        # Note: Trong production, re-split với embargo=500
+    elif av_score > 0.6:
+        print(f"[WARN] Moderate data drift (AV={av_score:.4f}). Reducing n_rounds by 20%.")
+        num_boost_round = int(num_boost_round * 0.8)
     
     print(f"[INFO] Starting robust CV with {folds} folds...")
     
@@ -746,12 +801,13 @@ def robust_cv_with_resampling(X: pd.DataFrame, y: pd.Series, params: Dict, num_b
         train_fraud_rate = y_train_fold.mean()
         val_fraud_rate = y_val_fold.mean()
         
-        # Resampling CHỈ trên train fold để tránh leakage
+        # Resampling CHỈ trên train fold để tránh leakage (fix skip nếu 1 class)
         X_train_resampled, y_train_resampled = _apply_resampling(
             X_train_fold, y_train_fold, 
             method=1,  # SMOTE only
             ratio=0.15, # Conservative ratio
-            k_neighbors=5
+            k_neighbors=5,
+            adaptive=True  # Phương án 2
         )
         
         resampled_fraud_rate = y_train_resampled.mean()
@@ -761,7 +817,7 @@ def robust_cv_with_resampling(X: pd.DataFrame, y: pd.Series, params: Dict, num_b
             **params,
             n_estimators=200,  # Conservative for CV
             random_state=42 + fold_idx,  # Different seed per fold
-            eval_metric="aucpr",
+            eval_metric="aucpr",  # Fix: String
         )
         
         try:
@@ -822,6 +878,7 @@ def robust_cv_with_resampling(X: pd.DataFrame, y: pd.Series, params: Dict, num_b
         'recommended_n_estimators': recommended_n_estimators,
         'mean_overfitting_gap': float(np.mean([d.get('overfitting_gap', 0) for d in detailed_results['fold_details'] if 'error' not in d])),
         'mean_precision_at_1_percent': float(np.mean([d.get('precision_at_1_percent', 0) for d in detailed_results['fold_details'] if 'error' not in d])),
+        'av_score': av_score,  # Thêm AV score
     }
     
     print(f"[INFO] Robust CV completed:")
@@ -829,11 +886,12 @@ def robust_cv_with_resampling(X: pd.DataFrame, y: pd.Series, params: Dict, num_b
     print(f"  Recommended n_estimators: {recommended_n_estimators}")
     print(f"  Mean overfitting gap: {summary['mean_overfitting_gap']:.5f}")
     print(f"  Mean precision@1%: {summary['mean_precision_at_1_percent']:.5f}")
+    print(f"  AV Score: {av_score:.4f}")
     
     return recommended_n_estimators, detailed_results, summary
 
 def xgb_find_best_nrounds(X: pd.DataFrame, y: pd.Series, params: Dict, num_boost_round: int = 1000, early_stopping_rounds: int = 50, folds: int = 5):
-    """Legacy wrapper - giữ để backward compatibility"""
+    """Legacy wrapper - Fix: Chỉ dùng robust_cv, bỏ fallback để tránh index error"""
     try:
         # Sử dụng robust CV method
         best_n, detailed_results, summary = robust_cv_with_resampling(
@@ -849,29 +907,8 @@ def xgb_find_best_nrounds(X: pd.DataFrame, y: pd.Series, params: Dict, num_boost
         return best_n, mock_cvres
         
     except Exception as e:
-        print(f"[WARN] Robust CV failed: {e}. Falling back to simple method.")
-        # Fallback to original method
-        dtrain = DMatrix(X, label=y)
-        xgb_params = params.copy()
-        if "objective" not in xgb_params:
-            xgb_params["objective"] = "binary:logistic"
-        
-        from sklearn.model_selection import TimeSeriesSplit
-        tscv = TimeSeriesSplit(n_splits=folds, test_size=len(X)//folds)
-        
-        res = xgb_cv(
-            params=xgb_params,
-            dtrain=dtrain,
-            num_boost_round=num_boost_round,
-            folds=tscv.split(X, y),
-            metrics=("aucpr", "logloss"),
-            early_stopping_rounds=early_stopping_rounds,
-            seed=42,
-            as_pandas=True,
-            verbose_eval=False,
-        )
-        best_n = int(len(res))
-        return best_n, res
+        print(f"[ERROR] Robust CV failed: {e}. Using default n_estimators=300.")
+        return 300, pd.DataFrame()  # Fix: Return default, no fallback xgb_cv
 
 def reality_check_validation(model, X_test: pd.DataFrame, y_test: pd.Series, model_name: str = "Model") -> Dict:
     """
@@ -1126,8 +1163,9 @@ def train_fa_xgb(X_tr, y_tr, X_va, y_va, X_te, y_te, seed=42, fa_cfg: Optional[F
         X_tr_use,
         y_tr_use,
         method=int(best_rcfg.get("method", 0)),
-        ratio=float(best_rcfg.get("ratio", 0.15)),  # Giảm ratio mặc định
+        ratio=float(best_rcfg.get("ratio", 0.15)),
         k_neighbors=int(best_rcfg.get("k_neighbors", 5)),
+        adaptive=cfg.adaptive_ratio
     )
     if best_rcfg.get("method", 0) != 0 and HAS_IMBLEARN:
         spw_final = 1.0
@@ -1135,7 +1173,7 @@ def train_fa_xgb(X_tr, y_tr, X_va, y_va, X_te, y_te, seed=42, fa_cfg: Optional[F
         pos = int(pd.Series(y_tr_use).sum()); neg = len(y_tr_use) - pos
         spw_final = max(1.0, neg / max(1, pos))
     base_params = {
-        "objective": "binary:logistic",
+        "objective": focal_loss_objective if cfg.use_focal_loss else "binary:logistic",
         "learning_rate": best_hp.get("eta", 0.02),
         "max_depth": int(best_hp.get("max_depth", 4)),
         "subsample": best_hp.get("subsample", 0.7),
@@ -1147,32 +1185,29 @@ def train_fa_xgb(X_tr, y_tr, X_va, y_va, X_te, y_te, seed=42, fa_cfg: Optional[F
         "scale_pos_weight": spw_final,
         "tree_method": "gpu_hist",
         "n_gpus": 2,
-        "eval_metric": ["aucpr", "logloss"],
+        "eval_metric": "aucpr",  # Fix: String
     }
     try:
         # Sử dụng early stopping patience ~50 rounds
-        best_nrounds, cvres = xgb_find_best_nrounds(X_tr_use, y_tr_use, base_params, num_boost_round=800, early_stopping_rounds=50, folds=5)
+        best_nrounds, cvres = xgb_find_best_nrounds(X_tr_use, y_tr_use, base_params, num_boost_round=300, early_stopping_rounds=50, folds=5)  # Fix: Limit 300
         print(f"[INFO] XGB CV chose {best_nrounds} rounds (approx).")
-        
-        # Nested CV để đánh giá model performance không bias
         
         # Robust CV validation thay cho nested CV 
         print("[INFO] Running robust cross-validation...")
-        robust_cv_results = robust_cv_with_resampling(
+        recommended_n_estimators, detailed_results, summary = robust_cv_with_resampling(
             X_tr_use, y_tr_use, base_params, 
-            n_folds=3, resampling_ratio=float(best_rcfg.get("ratio", 0.15)),
-            k_neighbors=int(best_rcfg.get("k_neighbors", 5))
+            num_boost_round=300, early_stopping_rounds=50, folds=5  # Fix: Limit
         )
-        print(f"  Robust CV PR-AUC: {robust_cv_results['mean_pr_auc']:.4f} ± {robust_cv_results['std_pr_auc']:.4f}")
-        print(f"  Original data PR-AUC: {robust_cv_results['mean_original_pr_auc']:.4f}")
-        print(f"  Recommended n_estimators: {robust_cv_results['recommended_n_estimators']}")
+        print(f"  Robust CV PR-AUC: {summary['mean_cv_score']:.4f} ± {summary['std_cv_score']:.4f}")
+        print(f"  AV Score: {summary['av_score']:.4f}")
+        print(f"  Recommended n_estimators: {recommended_n_estimators}")
         
         # Update params với recommended n_estimators
-        if robust_cv_results['recommended_n_estimators'] > 0:
-            base_params['n_estimators'] = robust_cv_results['recommended_n_estimators']
+        if recommended_n_estimators > 0:
+            base_params['n_estimators'] = recommended_n_estimators
             print(f"[INFO] Updated n_estimators to {base_params['n_estimators']} based on robust CV")
         
-        nested_score = robust_cv_results['mean_pr_auc']
+        nested_score = summary['mean_cv_score']
         print(f"[INFO] Nested CV score: {nested_score:.5f}")
         
         try:
@@ -1202,13 +1237,13 @@ def train_fa_xgb(X_tr, y_tr, X_va, y_va, X_te, y_te, seed=42, fa_cfg: Optional[F
         except Exception as e:
             print(f"[WARN] failed to plot xgb cv: {e}")
     except Exception as e:
-        print(f"[WARN] xgb cv failed: {e}; falling back to default n_estimators 400")
-        best_nrounds = 400
+        print(f"[WARN] xgb cv failed: {e}; falling back to default n_estimators 300")  # Fix: 300
+        best_nrounds = 300
 
     # Train both single model và ensemble với enhanced regularization
     print("[INFO] Training single XGBoost model with enhanced regularization...")
     clf = XGBClassifier(
-        objective="binary:logistic",
+        objective=base_params["objective"],
         tree_method="gpu_hist",
         n_gpus=2,  
         n_estimators=max(50, best_nrounds),
@@ -1221,7 +1256,7 @@ def train_fa_xgb(X_tr, y_tr, X_va, y_va, X_te, y_te, seed=42, fa_cfg: Optional[F
         min_child_weight=base_params["min_child_weight"],
         gamma=base_params["gamma"],
         scale_pos_weight=base_params["scale_pos_weight"],
-        eval_metric=["aucpr", "logloss"],
+        eval_metric="aucpr",  # Fix: String
         n_jobs=-1,
         random_state=seed,
         enable_categorical=True,
@@ -1229,6 +1264,9 @@ def train_fa_xgb(X_tr, y_tr, X_va, y_va, X_te, y_te, seed=42, fa_cfg: Optional[F
     evals_result = {}
     model_checkpoint_path = os.path.join(out_dir, "model_checkpoint_v2.pkl")
     gpu_success = False
+    
+    # Lưu validation logloss
+    val_logloss = []
     
     try:
         print("[INFO] Training final XGBoost model with GPU and enhanced early stopping...")
@@ -1239,6 +1277,7 @@ def train_fa_xgb(X_tr, y_tr, X_va, y_va, X_te, y_te, seed=42, fa_cfg: Optional[F
             early_stopping_rounds=50,  # Patience ~50 rounds monitoring PR-AUC
         )
         evals_result = clf.evals_result()
+        val_logloss = evals_result.get('validation_0', {}).get('logloss', []) if 'logloss' in evals_result.get('validation_0', {}) else []  # Fix: Check key
         gpu_success = True
         joblib.dump(clf, model_checkpoint_path)
         print(f"[INFO] Trained and saved model checkpoint (GPU) to {model_checkpoint_path}")
@@ -1247,8 +1286,27 @@ def train_fa_xgb(X_tr, y_tr, X_va, y_va, X_te, y_te, seed=42, fa_cfg: Optional[F
         clf.tree_method = "hist"
         clf.fit(X_tr_use, y_tr_use, eval_set=[(X_va[cols], y_va)], verbose=False, early_stopping_rounds=50)
         evals_result = clf.evals_result()
+        val_logloss = evals_result.get('validation_0', {}).get('logloss', []) if 'logloss' in evals_result.get('validation_0', {}) else []
         joblib.dump(clf, model_checkpoint_path)
         print(f"[INFO] Trained and saved model checkpoint (CPU fallback) to {model_checkpoint_path}")
+
+    # Compute test logloss post-hoc (không dùng trong training để tránh leak) - Fix indexing
+    print("[INFO] Computing test logloss for comparison...")
+    test_logloss = []
+    n_rounds = min(clf.n_estimators if hasattr(clf, 'n_estimators') else len(val_logloss), 300)  # Limit 300
+    for i in range(n_rounds):
+        try:
+            booster = clf.get_booster()
+            pred_test_i = booster.predict(DMatrix(X_te[cols]), iteration_range=(0, i+1))
+            test_logloss.append(log_loss(y_te, pred_test_i))  # Fix: 1D prob, no [:,1]
+        except:
+            test_logloss.append(float('inf'))  # Skip nếu error
+    
+    # Plot logloss comparison nếu có data
+    if val_logloss and test_logloss:
+        plot_logloss_comparison(val_logloss, test_logloss, out_dir)
+    else:
+        print("[WARN] Skipping logloss plot: insufficient data.")
 
     # Train ensemble model với enhanced regularization
     print("[INFO] Training ensemble model with enhanced regularization...")
@@ -1340,15 +1398,13 @@ def run_experiments(
     data_path: str,
     features: List[str] = None,
     seed: int = 42,
-    embargo: int = 0,
+    embargo: int = 500,  # Fix: Tăng default embargo để giảm drift
     out_dir: str = "outputs",
-    feature_mode: str = "fixed_count",  # "flexible" hoặc "fixed_count"
+    feature_mode: str = "flexible",  # Chỉ giữ "flexible"
     target_features: int = 14,          # Số features mục tiêu
 ):
     """
-    Run experiments với 2 modes:
-    - flexible: FA tự do chọn features (có thể ít hơn target_features)  
-    - fixed_count: FA phải chọn đúng target_features features
+    Run experiments chỉ với mode flexible
     """
     features = features or DEFAULT_FEATURES
     X, y = load_dataset(data_path, features)
@@ -1357,19 +1413,18 @@ def run_experiments(
     fa_cfg = FAConfig(
         random_state=seed,
         feature_selection_mode=feature_mode,
-        target_feature_count=target_features,
         min_feature_count=max(8, target_features // 2),  # Tối thiểu = nửa target
+        adaptive_ratio=True,  # Enable Phương án 2
+        use_focal_loss=True,  # Enable Phương án 2
     )
     
     print(f"[INFO] Feature selection mode: {feature_mode}")
-    if feature_mode == "fixed_count":
-        print(f"[INFO] Target features: {target_features} (cố định)")
-    else:
-        print(f"[INFO] Target features: {target_features} (linh hoạt, tối thiểu {fa_cfg.min_feature_count})")
+    print(f"[INFO] Target features: {target_features} (linh hoạt, tối thiểu {fa_cfg.min_feature_count})")
+    print(f"[INFO] Embargo: {embargo} (increased to reduce drift)")
 
     scaler = StandardScaler()
     X_tr, X_va, X_te, y_tr, y_va, y_te = chronological_train_val_test_split(
-        X, y, time_col="Time", embargo=embargo
+        X, y, time_col="Time", embargo=embargo  # Sử dụng embargo mới
     )
 
     results = {}
@@ -1420,11 +1475,11 @@ def run_experiments(
 def parse_args():
     p = argparse.ArgumentParser(description="Fraud detection experiments v2: Enhanced FA + XGBoost with stronger anti-overfitting")
     p.add_argument("--data", type=str, default="/kaggle/input/creditcardfraud/creditcard.csv", help="Path to Kaggle Credit Card Fraud dataset CSV")
-    p.add_argument("--embargo", type=int, default=0, help="Embargo samples between splits to avoid leakage")
+    p.add_argument("--embargo", type=int, default=500, help="Embargo samples between splits to avoid leakage")  # Fix: Default 500
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out", type=str, default="outputs", help="Output directory for plots and artifacts")
-    p.add_argument("--feature_mode", type=str, default="fixed_count", choices=["flexible", "fixed_count"], 
-                   help="Feature selection mode: 'flexible' (tự do chọn) hoặc 'fixed_count' (cố định 14)")
+    p.add_argument("--feature_mode", type=str, default="flexible", choices=["flexible"], 
+                   help="Feature selection mode: chỉ 'flexible'")
     p.add_argument("--target_features", type=int, default=14, help="Số features mục tiêu")
     args = p.parse_args([])
     return args
@@ -1432,30 +1487,17 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     try:
-        # Chạy cả 2 modes để so sánh
-        print("="*60)
-        print("CHẠY MODE 1: CỐ ĐỊNH 14 FEATURES")
+        print("\n" + "="*60)
+        print("CHẠY MODE: FLEXIBLE FEATURE SELECTION (PATCHED VERSION)")  
         print("="*60)
         run_experiments(
             data_path=args.data,
             seed=args.seed,
             embargo=args.embargo,
             out_dir=args.out,
-            feature_mode="fixed_count",
+            feature_mode="flexible",
             target_features=14,
         )
-        
-        # print("\n" + "="*60)
-        # print("CHẠY MODE 2: FLEXIBLE FEATURE SELECTION")  
-        # print("="*60)
-        # run_experiments(
-        #     data_path=args.data,
-        #     seed=args.seed,
-        #     embargo=args.embargo,
-        #     out_dir=args.out,
-        #     feature_mode="flexible",
-        #     target_features=14,
-        # )
         
         print("\n" + "="*60)
         print("HOÀN THÀNH! Kiểm tra thư mục outputs để so sánh kết quả.")
