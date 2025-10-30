@@ -51,7 +51,7 @@ class FAConfig:
     
     # Advanced options (for future FA implementation)
     n_fireflies: int = 30                  # Số fireflies (nếu implement full FA)
-    n_epochs: int = 20                     # Số epochs (nếu implement full FA)
+    n_epochs: int = 15                     # Số epochs (nếu implement full FA)
     alpha: float = 0.25                    # Exploration rate
     beta0: float = 2.0                     # Attraction coefficient
     gamma: float = 0.20                    # Light absorption coefficient
@@ -191,7 +191,7 @@ class MissingValueHandler(BaseEstimator, TransformerMixin):
 # ============================================================================
 
 class FeatureSelector(BaseEstimator, TransformerMixin):
-    """Feature Selection using random selection (simulating FA)"""
+    """Feature Selection using FULL Firefly Algorithm"""
     
     def __init__(self, config: FAConfig = None):
         """
@@ -209,42 +209,222 @@ class FeatureSelector(BaseEstimator, TransformerMixin):
         self.min_feature_ratio = config.min_feature_ratio
         self.max_feature_ratio = config.max_feature_ratio
         self.min_feature_count = config.min_feature_count
-        self.feature_selection_mode = config.feature_selection_mode
+        
+        # FA parameters
+        self.n_fireflies = config.n_fireflies
+        self.n_epochs = config.n_epochs
+        self.alpha = config.alpha
+        self.beta0 = config.beta0
+        self.gamma = config.gamma
+        self.lambda_feat = config.lambda_feat
+        self.diversity_threshold = config.diversity_threshold
+        self.patience = config.patience
         
         self.selected_features_ = None
         self.feature_names_ = None
+        self.best_fitness_ = -np.inf
+        self.fitness_history_ = []
+    
+    def _initialize_fireflies(self, n_features, target_n_features):
+        """Initialize firefly population (binary vectors)"""
+        fireflies = []
+        for _ in range(self.n_fireflies):
+            # Random binary vector
+            firefly = np.random.rand(n_features) < (target_n_features / n_features)
+            # Ensure minimum features
+            if firefly.sum() < self.min_feature_count:
+                indices = np.random.choice(n_features, self.min_feature_count, replace=False)
+                firefly = np.zeros(n_features, dtype=bool)
+                firefly[indices] = True
+            fireflies.append(firefly.astype(float))
+        return np.array(fireflies)
+    
+    def _calculate_fitness(self, firefly, X, y):
+        """Calculate fitness of a firefly (feature subset)"""
+        selected_indices = firefly > 0.5
+        n_selected = selected_indices.sum()
+        
+        # Check minimum features
+        if n_selected < self.min_feature_count:
+            return -1000.0
+        
+        # Get selected features
+        X_selected = X[:, selected_indices] if not isinstance(X, pd.DataFrame) else X.iloc[:, selected_indices]
+        
+        # Quick validation using a simple model
+        from sklearn.ensemble import RandomForestClassifier
+        from sklearn.model_selection import cross_val_score
+        
+        # Use small RF for fast evaluation
+        clf = RandomForestClassifier(
+            n_estimators=50, 
+            max_depth=5, 
+            random_state=self.random_state,
+            n_jobs=1
+        )
+        
+        # Cross-validation score
+        try:
+            scores = cross_val_score(clf, X_selected, y, cv=3, scoring='roc_auc', n_jobs=1)
+            auc_score = scores.mean()
+        except:
+            auc_score = 0.0
+        
+        # Fitness = AUC - feature penalty
+        fitness = auc_score - self.lambda_feat * (n_selected / len(firefly))
+        
+        return fitness
+    
+    def _distance(self, firefly_i, firefly_j):
+        """Calculate Euclidean distance between two fireflies"""
+        return np.sqrt(np.sum((firefly_i - firefly_j) ** 2))
+    
+    def _attractiveness(self, distance):
+        """Calculate attractiveness based on distance"""
+        return self.beta0 * np.exp(-self.gamma * distance ** 2)
+    
+    def _move_firefly(self, firefly_i, firefly_j, alpha):
+        """Move firefly i towards firefly j"""
+        distance = self._distance(firefly_i, firefly_j)
+        beta = self._attractiveness(distance)
+        
+        # Movement equation
+        random_vector = np.random.rand(len(firefly_i)) - 0.5
+        new_position = firefly_i + beta * (firefly_j - firefly_i) + alpha * random_vector
+        
+        # Convert to binary (0 or 1)
+        new_position = (1 / (1 + np.exp(-new_position)) > 0.5).astype(float)
+        
+        return new_position
+    
+    def _ensure_diversity(self, fireflies):
+        """Ensure diversity in population"""
+        unique_fireflies = []
+        for firefly in fireflies:
+            is_duplicate = False
+            for unique in unique_fireflies:
+                if np.array_equal(firefly, unique):
+                    is_duplicate = True
+                    break
+            if not is_duplicate:
+                unique_fireflies.append(firefly)
+        
+        # Add random fireflies if diversity is low
+        n_features = len(fireflies[0])
+        while len(unique_fireflies) < self.n_fireflies:
+            random_firefly = (np.random.rand(n_features) < 0.5).astype(float)
+            # Ensure minimum features
+            if random_firefly.sum() < self.min_feature_count:
+                indices = np.random.choice(n_features, self.min_feature_count, replace=False)
+                random_firefly = np.zeros(n_features, dtype=float)
+                random_firefly[indices] = 1.0
+            unique_fireflies.append(random_firefly)
+        
+        # Return exactly n_fireflies
+        return np.array(unique_fireflies[:self.n_fireflies])
     
     def fit(self, X, y=None):
+        """Fit using Firefly Algorithm for feature selection"""
         np.random.seed(self.random_state)
+        
+        print("\n" + "="*60)
+        print(" FIREFLY ALGORITHM - FEATURE SELECTION ")
+        print("="*60)
         
         # Get feature names
         if isinstance(X, pd.DataFrame):
             self.feature_names_ = X.columns.tolist()
+            X_array = X.values
         else:
             self.feature_names_ = [f"feature_{i}" for i in range(X.shape[1])]
+            X_array = X
         
-        # Calculate number of features to select
         n_features = len(self.feature_names_)
+        
+        # Calculate target number of features
         min_features = max(self.min_feature_count, int(n_features * self.min_feature_ratio))
         max_features = int(n_features * self.max_feature_ratio)
-        n_selected = int(n_features * self.selection_ratio)
-        n_selected = max(min_features, min(n_selected, max_features))
+        target_n_features = int(n_features * self.selection_ratio)
+        target_n_features = max(min_features, min(target_n_features, max_features))
         
-        # Random selection (simulating FA)
-        self.selected_features_ = np.random.choice(
-            self.feature_names_, 
-            size=n_selected, 
-            replace=False
-        ).tolist()
+        print(f"\n[INFO] FA Configuration:")
+        print(f"  - Total features: {n_features}")
+        print(f"  - Target features: {target_n_features} ({self.selection_ratio:.1%})")
+        print(f"  - Fireflies: {self.n_fireflies}")
+        print(f"  - Epochs: {self.n_epochs}")
+        print(f"  - Alpha (randomness): {self.alpha}")
+        print(f"  - Beta0 (attraction): {self.beta0}")
+        print(f"  - Gamma (absorption): {self.gamma}")
         
-        print(f"[INFO] Feature Selection (FA Config):")
-        print(f"  - Selection ratio: {self.selection_ratio:.2f}")
-        print(f"  - Selected: {n_selected}/{n_features} features")
-        print(f"  - Mode: {self.feature_selection_mode}")
+        # Initialize firefly population
+        fireflies = self._initialize_fireflies(n_features, target_n_features)
+        fitness_values = np.array([self._calculate_fitness(f, X_array, y) for f in fireflies])
+        
+        # Track best solution
+        best_idx = np.argmax(fitness_values)
+        best_firefly = fireflies[best_idx].copy()
+        self.best_fitness_ = fitness_values[best_idx]
+        
+        print(f"\n[INFO] Initial best fitness: {self.best_fitness_:.4f}")
+        print(f"  - Features selected: {int(best_firefly.sum())}")
+        
+        # Early stopping
+        no_improvement = 0
+        
+        # FA iterations
+        for epoch in range(self.n_epochs):
+            # Update alpha (decrease over time)
+            alpha_t = self.alpha * (0.95 ** epoch)
+            
+            # For each firefly
+            for i in range(self.n_fireflies):
+                # Compare with all other fireflies
+                for j in range(self.n_fireflies):
+                    if fitness_values[j] > fitness_values[i]:
+                        # Move firefly i towards brighter firefly j
+                        fireflies[i] = self._move_firefly(fireflies[i], fireflies[j], alpha_t)
+                        
+                        # Recalculate fitness
+                        fitness_values[i] = self._calculate_fitness(fireflies[i], X_array, y)
+            
+            # Update best solution
+            current_best_idx = np.argmax(fitness_values)
+            current_best_fitness = fitness_values[current_best_idx]
+            
+            if current_best_fitness > self.best_fitness_:
+                self.best_fitness_ = current_best_fitness
+                best_firefly = fireflies[current_best_idx].copy()
+                no_improvement = 0
+                print(f"[Epoch {epoch+1}/{self.n_epochs}] ✨ New best fitness: {self.best_fitness_:.4f} (Features: {int(best_firefly.sum())})")
+            else:
+                no_improvement += 1
+            
+            self.fitness_history_.append(self.best_fitness_)
+            
+            # Ensure diversity every few epochs
+            if (epoch + 1) % 5 == 0:
+                fireflies = self._ensure_diversity(fireflies)
+                fitness_values = np.array([self._calculate_fitness(f, X_array, y) for f in fireflies])
+            
+            # Early stopping
+            if no_improvement >= self.patience:
+                print(f"\n[INFO] Early stopping at epoch {epoch+1} (no improvement for {self.patience} epochs)")
+                break
+        
+        # Get selected features from best firefly
+        selected_indices = best_firefly > 0.5
+        self.selected_features_ = [self.feature_names_[i] for i in range(n_features) if selected_indices[i]]
+        
+        print(f"\n[INFO] ✅ Feature Selection Complete!")
+        print(f"  - Final fitness: {self.best_fitness_:.4f}")
+        print(f"  - Selected: {len(self.selected_features_)}/{n_features} features")
+        print(f"  - Selection ratio: {len(self.selected_features_)/n_features:.1%}")
+        print("="*60 + "\n")
         
         return self
     
     def transform(self, X):
+        """Transform by selecting best features"""
         if isinstance(X, pd.DataFrame):
             return X[self.selected_features_]
         else:
@@ -262,6 +442,19 @@ def create_training_pipeline(random_state=42, use_feature_selection=False, fa_co
         use_feature_selection: Nếu True, sử dụng Feature Selection (FA mode)
         fa_config: FAConfig instance cho feature selection (optional)
     """
+    
+    # Check GPU availability
+    gpu_available = False
+    try:
+        import subprocess
+        result = subprocess.run(['nvidia-smi'], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            gpu_available = True
+            print("[INFO] 🚀 GPU detected! XGBoost will use GPU acceleration (tree_method='gpu_hist')")
+        else:
+            print("[INFO] ⚠️  No GPU detected. XGBoost will use CPU (tree_method='hist')")
+    except:
+        print("[INFO] ⚠️  GPU check failed. XGBoost will use CPU (tree_method='hist')")
     
     steps = [
         # Step 1: Extract date features
@@ -284,6 +477,41 @@ def create_training_pipeline(random_state=42, use_feature_selection=False, fa_co
         
         steps.append(('feature_selector', FeatureSelector(config=fa_config)))
     
+    # Configure XGBoost for GPU or CPU
+    if gpu_available:
+        xgb_params = {
+            'objective': 'binary:logistic',
+            'tree_method': 'gpu_hist',  # GPU acceleration
+            'device': 'cuda',            # Use CUDA
+            'n_estimators': 300,
+            'learning_rate': 0.05,
+            'max_depth': 5,
+            'subsample': 0.8,
+            'colsample_bytree': 0.8,
+            'reg_alpha': 2.0,
+            'reg_lambda': 5.0,
+            'min_child_weight': 5.0,
+            'eval_metric': 'aucpr',
+            'random_state': random_state
+        }
+    else:
+        xgb_params = {
+            'objective': 'binary:logistic',
+            'tree_method': 'hist',      # CPU histogram algorithm
+            'device': 'cpu',             # Use CPU
+            'n_estimators': 300,
+            'learning_rate': 0.05,
+            'max_depth': 5,
+            'subsample': 0.8,
+            'colsample_bytree': 0.8,
+            'reg_alpha': 2.0,
+            'reg_lambda': 5.0,
+            'min_child_weight': 5.0,
+            'eval_metric': 'aucpr',
+            'random_state': random_state,
+            'n_jobs': -1                 # Use all CPU cores
+        }
+    
     # Step 6: Resampling
     steps.extend([
         ('smote', BorderlineSMOTE(
@@ -298,22 +526,8 @@ def create_training_pipeline(random_state=42, use_feature_selection=False, fa_co
             sampling_strategy='auto'
         )),
         
-        # Step 8: XGBoost classifier
-        ('classifier', XGBClassifier(
-            objective='binary:logistic',
-            tree_method='hist',
-            n_estimators=300,
-            learning_rate=0.05,
-            max_depth=5,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_alpha=2.0,
-            reg_lambda=5.0,
-            min_child_weight=5.0,
-            eval_metric='aucpr',
-            random_state=random_state,
-            n_jobs=-1
-        ))
+        # Step 8: XGBoost classifier with GPU/CPU config
+        ('classifier', XGBClassifier(**xgb_params))
     ])
     
     pipeline = ImbPipeline(steps)
@@ -393,6 +607,70 @@ def plot_curves(results_dict, out_dir='outputs'):
     plt.close()
     
     print(f"\n[INFO] Saved curves to {out_dir}/roc_pr_curves_no_leakage.png")
+
+
+def plot_feature_importance(pipeline, feature_names, out_dir='outputs', top_n=20):
+    """
+    Plot feature importance from XGBoost classifier
+    
+    Args:
+        pipeline: Trained pipeline containing XGBoost
+        feature_names: List of feature names (after all transformations)
+        out_dir: Output directory
+        top_n: Number of top features to display
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    
+    # Get XGBoost classifier from pipeline
+    xgb_model = pipeline.named_steps['classifier']
+    
+    # Get feature importance
+    importance = xgb_model.feature_importances_
+    
+    # Create DataFrame
+    importance_df = pd.DataFrame({
+        'feature': feature_names,
+        'importance': importance
+    }).sort_values('importance', ascending=False)
+    
+    # Get top N features
+    top_features = importance_df.head(top_n)
+    
+    # Plot
+    plt.figure(figsize=(10, 8))
+    plt.barh(range(len(top_features)), top_features['importance'].values)
+    plt.yticks(range(len(top_features)), top_features['feature'].values)
+    plt.xlabel('Feature Importance (Gain)')
+    plt.title(f'Top {top_n} Feature Importances - XGBoost')
+    plt.gca().invert_yaxis()
+    plt.tight_layout()
+    
+    # Save plot
+    plt.savefig(os.path.join(out_dir, 'feature_importance.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"\n[INFO] Saved feature importance plot to {out_dir}/feature_importance.png")
+    
+    # Save to JSON
+    importance_dict = {
+        'top_features': top_features.to_dict('records'),
+        'all_features': importance_df.to_dict('records')
+    }
+    
+    with open(os.path.join(out_dir, 'feature_importance.json'), 'w') as f:
+        json.dump(importance_dict, f, indent=2)
+    
+    print(f"[INFO] Saved feature importance data to {out_dir}/feature_importance.json")
+    
+    # Print top features
+    print(f"\n{'='*60}")
+    print(f" TOP {top_n} MOST IMPORTANT FEATURES ")
+    print(f"{'='*60}")
+    for idx, row in top_features.iterrows():
+        print(f"  {row['feature']:30s} : {row['importance']:.6f}")
+    print(f"{'='*60}\n")
+    
+    return importance_df
 
 
 # ============================================================================
@@ -511,6 +789,27 @@ def main(mode: str = 'xgboost_smoteenn'):
             'Test': test_results
         }, out_dir)
         
+        # Plot feature importance
+        print("\n[INFO] Generating feature importance plot...")
+        
+        # Get feature names after all transformations (before SMOTE/ENN)
+        # Need to transform a sample to get the feature names
+        X_train_transformed = pipeline.named_steps['date_features'].transform(X_train.copy())
+        X_train_transformed = pipeline.named_steps['missing_handler'].fit_transform(X_train_transformed)
+        X_train_transformed = pipeline.named_steps['categorical_encoder'].fit_transform(X_train_transformed)
+        
+        if isinstance(X_train_transformed, pd.DataFrame):
+            feature_names_final = X_train_transformed.columns.tolist()
+        else:
+            feature_names_final = [f"feature_{i}" for i in range(X_train_transformed.shape[1])]
+        
+        importance_df = plot_feature_importance(
+            pipeline, 
+            feature_names_final, 
+            out_dir, 
+            top_n=20
+        )
+        
         # Save model
         model_path = os.path.join(out_dir, 'fraud_detection_smoteenn.pkl')
         joblib.dump(pipeline, model_path)
@@ -615,6 +914,17 @@ def main(mode: str = 'xgboost_smoteenn'):
             'Validation': val_results,
             'Test': test_results
         }, out_dir)
+        
+        # Plot feature importance (after FA selection)
+        print("\n[INFO] Generating feature importance plot (FA-selected features)...")
+        
+        # Feature names after FA selection are already in selected_features
+        importance_df = plot_feature_importance(
+            pipeline, 
+            selected_features,  # Use FA-selected features
+            out_dir, 
+            top_n=min(20, len(selected_features))  # Top N or all if less than 20
+        )
         
         # Save model
         model_path = os.path.join(out_dir, 'fraud_detection_fa_smoteenn.pkl')
