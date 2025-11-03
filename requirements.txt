@@ -1,0 +1,24 @@
+# ============================================================================
+# EXACT VERSIONS USED FOR TRAINING
+# ============================================================================
+# Cài đặt: pip install -r requirements.txt
+
+# Core ML libraries (EXACT versions từ training environment)
+scikit-learn==1.2.2
+imbalanced-learn==0.10.1
+xgboost==2.0.3
+
+# Data processing
+pandas
+numpy==1.26.4
+scipy==1.13.1
+
+# Utilities
+joblib
+threadpoolctl==2.1.0
+
+# Visualization
+matplotlib
+
+# Optional tools
+category-encoders
