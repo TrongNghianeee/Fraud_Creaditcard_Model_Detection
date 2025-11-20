@@ -953,18 +953,18 @@ def main(mode: str = 'xgboost_smoteenn'):
     os.makedirs(out_dir, exist_ok=True)
     
     # Load RAW data
-    data_path = 'fraudTrain.csv'  # Sử dụng fraudTrain.csv để so sánh fair
+    data_path = '/kaggle/input/fraud-detection/fraudTrain.csv'  # Sử dụng fraudTrain.csv để so sánh fair
     X, y = load_raw_data(data_path)
     
     # FA Config (chỉ dùng khi mode = xgboost_fa_smoteenn)
     fa_config = FAConfig(
-        selection_ratio=0.7,
-        min_feature_ratio=0.6,
-        max_feature_ratio=0.8,
-        min_feature_count=8,
-        n_fireflies=20,        # GIẢM: 30 → 20 để nhanh hơn 33%
-        n_epochs=10,           # GIẢM: 15 → 10 để nhanh hơn 33%
-        patience=4,            # GIẢM: 6 → 4 để early stop sớm hơn
+        selection_ratio=0.6,
+        min_feature_ratio=0.5,
+        max_feature_ratio=0.7,
+        min_feature_count=10,
+        n_fireflies=40,        
+        n_epochs=10,           
+        patience=4,            
         random_state=42
     )
     
@@ -996,46 +996,178 @@ def main(mode: str = 'xgboost_smoteenn'):
     print(f"Test:  {X_test.shape}, fraud rate: {y_test.mean():.4f}")
     
     # ========================================
-    # MODE: XGBoost + SMOTEENN
+    # MODE: XGBoost + SMOTEENN (NO Feature Selection)
     # ========================================
     
     if mode == 'xgboost_smoteenn':
         print("\n" + "="*80)
-        print(" XGBOOST + SMOTEENN (KHÔNG Feature Selection - No Leakage) ")
+        print(" XGBOOST + SMOTEENN (NO Feature Selection - Use ALL 21 Features) ")
         print("="*80)
         
         start_time = time.time()
         
-        # Create pipeline WITHOUT feature selection
-        pipeline = create_training_pipeline(
-            random_state=42, 
-            use_feature_selection=False
+        # STEP 1: Create preprocessing pipeline (NO resampling, NO classifier)
+        print("\n[STEP 1] Creating preprocessing pipeline...")
+        pipeline_steps = [
+            ('date_features', DateFeatureExtractor()),
+            ('missing_handler', MissingValueHandler()),
+            ('categorical_encoder', CategoricalEncoder()),
+            ('scaler', StandardScaler()),
+        ]
+        
+        from sklearn.pipeline import Pipeline as SkPipeline
+        preprocessing_pipeline = SkPipeline(pipeline_steps)
+        
+        # Fit preprocessing
+        print("[STEP 1.1] Running preprocessing on all sets...")
+        X_train_processed = preprocessing_pipeline.fit_transform(X_train)
+        X_val_processed = preprocessing_pipeline.transform(X_val)
+        X_test_processed = preprocessing_pipeline.transform(X_test)
+        
+        # Get feature names after preprocessing
+        if isinstance(X_train_processed, pd.DataFrame):
+            all_features = X_train_processed.columns.tolist()
+        else:
+            all_features = [f"feature_{i}" for i in range(X_train_processed.shape[1])]
+        
+        total_features = len(all_features)
+        print(f"\n[INFO] Total features after preprocessing: {total_features}")
+        print(f"[INFO] Using ALL features (no feature selection)")
+        
+        # STEP 2: Apply SMOTE + ENN ONLY on training set
+        print("\n[STEP 2] Applying SMOTE + ENN on training set only...")
+        smote = BorderlineSMOTE(
+            random_state=42,
+            k_neighbors=5,
+            sampling_strategy=0.1
+        )
+        enn = EditedNearestNeighbours(
+            n_neighbors=3,
+            sampling_strategy='auto'
         )
         
+        X_train_resampled, y_train_resampled = smote.fit_resample(X_train_processed, y_train)
+        X_train_resampled, y_train_resampled = enn.fit_resample(X_train_resampled, y_train_resampled)
+        
+        print(f"  - Original train: {X_train_processed.shape}")
+        print(f"  - After SMOTE+ENN: {X_train_resampled.shape}")
+        print(f"  - Fraud rate: {y_train_resampled.mean():.4f}")
+        
+        # Check GPU availability
+        gpu_available = False
+        try:
+            import subprocess
+            result = subprocess.run(['nvidia-smi'], capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                gpu_available = True
+                print("\n[INFO] 🚀 GPU detected for Optuna tuning!")
+        except:
+            print("\n[INFO] ⚠️  No GPU detected. Using CPU for Optuna tuning.")
+        
+        # STEP 3: Optuna hyperparameter tuning
+        print("\n[STEP 3] Running Optuna hyperparameter tuning...")
+        best_params = tune_xgboost_with_optuna(
+            X_train_resampled, y_train_resampled,
+            X_val_processed, y_val,
+            n_trials=50,
+            use_gpu=gpu_available
+        )
+        
+        # If Optuna failed, use default params
+        if best_params is None:
+            best_params = {
+                'n_estimators': 250,
+                'learning_rate': 0.04,
+                'max_depth': 5,
+                'subsample': 0.8,
+                'colsample_bytree': 0.8,
+                'reg_alpha': 3.0,
+                'reg_lambda': 6.0,
+                'min_child_weight': 6.0,
+                'gamma': 0.0
+            }
+        
+        # Add base params
+        best_params['objective'] = 'binary:logistic'
+        best_params['eval_metric'] = 'aucpr'
+        best_params['random_state'] = 42
+        best_params['verbosity'] = 0
+        
+        if gpu_available:
+            best_params['tree_method'] = 'gpu_hist'
+            best_params['device'] = 'cuda'
+        else:
+            best_params['tree_method'] = 'hist'
+            best_params['device'] = 'cpu'
+            best_params['n_jobs'] = -1
+        
         # Calculate scale_pos_weight
-        pos = int(y_train.sum())
-        neg = len(y_train) - pos
+        pos = int(y_train_resampled.sum())
+        neg = len(y_train_resampled) - pos
         scale_pos_weight = neg / pos
+        best_params['scale_pos_weight'] = scale_pos_weight
         
-        # Set scale_pos_weight
-        pipeline.named_steps['classifier'].set_params(scale_pos_weight=scale_pos_weight)
+        # STEP 4: Train final model with best params
+        print(f"\n[STEP 4] Training final XGBoost with optimized params...")
+        print(f"  - scale_pos_weight: {scale_pos_weight:.2f}")
         
-        print(f"\n[INFO] Training with scale_pos_weight={scale_pos_weight:.2f}")
-        
-        # Fit pipeline
-        pipeline.fit(X_train, y_train)
+        final_classifier = XGBClassifier(**best_params)
+        final_classifier.fit(X_train_resampled, y_train_resampled)
         
         training_time = time.time() - start_time
         print(f"\n[INFO] Training completed in {training_time:.2f} seconds")
         
-        # Evaluate
+        # STEP 5: Find optimal threshold on validation set
+        print("\n[STEP 5] Finding optimal threshold on validation set...")
+        y_val_proba = final_classifier.predict_proba(X_val_processed)[:, 1]
+        
+        optimal_threshold, best_f1, threshold_metrics = find_optimal_threshold(
+            y_val, y_val_proba, metric='f1'
+        )
+        
+        print(f"\n[INFO] ✅ Optimal threshold found!")
+        print(f"  - Threshold: {optimal_threshold:.4f} (default: 0.5)")
+        print(f"  - Val Precision: {threshold_metrics['precision']:.4f}")
+        print(f"  - Val Recall: {threshold_metrics['recall']:.4f}")
+        print(f"  - Val F1-Score: {threshold_metrics['f1']:.4f}")
+        
+        # Evaluate with optimal threshold
         print("\n" + "="*60)
-        print(" EVALUATION RESULTS ")
+        print(" EVALUATION RESULTS (OPTIMIZED THRESHOLD) ")
         print("="*60)
         
-        train_results = evaluate_model(pipeline, X_train, y_train, "TRAIN")
-        val_results = evaluate_model(pipeline, X_val, y_val, "VALIDATION")
-        test_results = evaluate_model(pipeline, X_test, y_test, "TEST")
+        train_results = evaluate_model_with_threshold(
+            type('Pipeline', (), {
+                'predict_proba': lambda self, X: final_classifier.predict_proba(
+                    preprocessing_pipeline.transform(X)
+                )
+            })(),
+            X_train, y_train,
+            threshold=optimal_threshold,
+            dataset_name="TRAIN"
+        )
+        
+        val_results = evaluate_model_with_threshold(
+            type('Pipeline', (), {
+                'predict_proba': lambda self, X: final_classifier.predict_proba(
+                    preprocessing_pipeline.transform(X)
+                )
+            })(),
+            X_val, y_val,
+            threshold=optimal_threshold,
+            dataset_name="VALIDATION"
+        )
+        
+        test_results = evaluate_model_with_threshold(
+            type('Pipeline', (), {
+                'predict_proba': lambda self, X: final_classifier.predict_proba(
+                    preprocessing_pipeline.transform(X)
+                )
+            })(),
+            X_test, y_test,
+            threshold=optimal_threshold,
+            dataset_name="TEST"
+        )
         
         # Add y_true for plotting
         train_results['y_true'] = y_train
@@ -1049,31 +1181,34 @@ def main(mode: str = 'xgboost_smoteenn'):
             'Test': test_results
         }, out_dir)
         
-        # Plot feature importance
-        print("\n[INFO] Generating feature importance plot...")
+        # Plot feature importance (all 21 features)
+        print("\n[INFO] Generating feature importance plot (ALL features)...")
         
-        # Get feature names after all transformations (before SMOTE/ENN)
-        # Need to transform a sample to get the feature names
-        X_train_transformed = pipeline.named_steps['date_features'].transform(X_train.copy())
-        X_train_transformed = pipeline.named_steps['missing_handler'].fit_transform(X_train_transformed)
-        X_train_transformed = pipeline.named_steps['categorical_encoder'].fit_transform(X_train_transformed)
-        
-        if isinstance(X_train_transformed, pd.DataFrame):
-            feature_names_final = X_train_transformed.columns.tolist()
-        else:
-            feature_names_final = [f"feature_{i}" for i in range(X_train_transformed.shape[1])]
+        dummy_pipeline = type('Pipeline', (), {
+            'named_steps': {'classifier': final_classifier}
+        })()
         
         importance_df = plot_feature_importance(
-            pipeline, 
-            feature_names_final, 
-            out_dir, 
-            top_n=20
+            dummy_pipeline,
+            all_features,
+            out_dir,
+            top_n=min(20, len(all_features))
         )
         
-        # Save model
+        # Save complete pipeline
+        complete_pipeline = FraudDetectionPipeline(
+            preprocessing_pipeline,
+            final_classifier,
+            threshold=optimal_threshold
+        )
+        
         model_path = os.path.join(out_dir, 'fraud_detection_smoteenn.pkl')
-        joblib.dump(pipeline, model_path)
+        joblib.dump(complete_pipeline, model_path)
         print(f"\n[INFO] Model saved to {model_path}")
+        print(f"[INFO] Pipeline includes:")
+        print(f"  - Preprocessor: {list(preprocessing_pipeline.named_steps.keys())}")
+        print(f"  - Classifier: XGBoost")
+        print(f"  - Optimal threshold: {optimal_threshold:.4f}")
         
         # Overfitting check
         print("\n" + "="*60)
@@ -1091,23 +1226,45 @@ def main(mode: str = 'xgboost_smoteenn'):
         else:
             print("\n⚠️  Warning: Possible overfitting or data distribution mismatch.")
         
+        # Convert best_params to native Python types
+        best_params_json = {}
+        for key, value in best_params.items():
+            if isinstance(value, (np.integer, np.floating)):
+                best_params_json[key] = float(value)
+            else:
+                best_params_json[key] = value
+        
         # Save results to JSON
         results_json = {
             'mode': mode,
             'train': {k: v for k, v in train_results.items() if k not in ['y_proba', 'y_true']},
             'val': {k: v for k, v in val_results.items() if k not in ['y_proba', 'y_true']},
             'test': {k: v for k, v in test_results.items() if k not in ['y_proba', 'y_true']},
-            'training_time_sec': float(training_time),  # Convert to float
+            'training_time_sec': float(training_time),
             'val_test_gap': {
                 'roc_auc': float(val_test_gap_roc),
                 'pr_auc': float(val_test_gap_pr)
-            }
+            },
+            'threshold_tuning': {
+                'optimal_threshold': float(optimal_threshold),
+                'default_threshold': 0.5,
+                'threshold_metrics': threshold_metrics
+            },
+            'feature_selection': {
+                'total_features': int(total_features),
+                'selected_count': int(total_features),
+                'selected_features': all_features,
+                'note': 'NO feature selection - using ALL features'
+            },
+            'xgboost_params': best_params_json
         }
         
         with open(os.path.join(out_dir, 'results_no_leakage.json'), 'w') as f:
             json.dump(results_json, f, indent=2)
         
         print(f"\n[INFO] Results saved to {out_dir}/results_no_leakage.json")
+        
+        pipeline = complete_pipeline  # Return complete pipeline
     
     # ========================================
     # MODE: XGBoost + FA + SMOTEENN
@@ -1429,35 +1586,90 @@ if __name__ == "__main__":
     """
     Chạy training với pipeline KHÔNG có data leakage
     
-    Key improvements V2:
+    Key improvements V3 (FINAL):
     1. Load RAW data (không preprocessing trước)
     2. Split FIRST (train/val/test = 60/20/20)
-    3. Preprocessing trong Pipeline
+    3. Preprocessing trong Pipeline riêng biệt
     4. SMOTE/ENN chỉ áp dụng trên train set (sampling_strategy=0.1)
     5. Val và Test KHÔNG được resample
-    6. FA mode="importance" (XGBoost quick eval thay RF)
-    7. Optuna hyperparameter tuning (50 trials)
-    8. Threshold tuning (maximize F1 on validation set)
+    6. Optuna hyperparameter tuning (50 trials) - BOTH MODES
+    7. Threshold tuning (maximize F1 on validation set) - BOTH MODES
+    8. FraudDetectionPipeline wrapper - BOTH MODES
     9. Chạy trên fraudTrain.csv để so sánh fair
     
-    Modes:
-        - 'xgboost_smoteenn': XGBoost + SMOTEENN (KHÔNG Feature Selection)
-        - 'xgboost_fa_smoteenn': XGBoost + FA + SMOTEENN + Optuna + Threshold Tuning
+    ════════════════════════════════════════════════════════════════════════
+    📊 MODE COMPARISON - BOTH USE IDENTICAL WORKFLOW (except feature selection)
+    ════════════════════════════════════════════════════════════════════════
     
-    Expected improvements:
-        - Precision: ~0.3-0.4 (lên từ 0.118)
-        - F1-Score: ~0.5+ (lên từ ~0.2)
-        - Optimal threshold: ~0.2-0.3 (thay vì 0.5)
+    MODE 1: 'xgboost_smoteenn' (NO Feature Selection - ALL 21 features)
+    ────────────────────────────────────────────────────────────────────
+    Workflow:
+      1. Load RAW data
+      2. Split (60/20/20)
+      3. PREPROCESSING (DateFeatureExtractor → MissingValueHandler → 
+                        CategoricalEncoder → StandardScaler)
+         → Result: 21 features
+      4. NO Feature Selection → Use ALL 21 features
+      5. RESAMPLING (TRAIN SET ONLY!)
+         - BorderlineSMOTE (sampling_strategy=0.1)
+         - EditedNearestNeighbours
+      6. OPTUNA HYPERPARAMETER TUNING (50 trials)
+      7. TRAIN FINAL XGBOOST MODEL (with optimized params)
+      8. THRESHOLD OPTIMIZATION (on Validation set)
+      9. Complete Pipeline → Save Model → Evaluation
     
-    Để tùy chỉnh FA config, sửa trực tiếp trong main() function.
+    Expected:
+      - Uses ALL 21 features (no feature reduction)
+      - Baseline comparison for FA mode
+      - May have lower performance due to irrelevant features
+    
+    
+    MODE 2: 'xgboost_fa_smoteenn' (WITH FA Feature Selection - ~15 features)
+    ────────────────────────────────────────────────────────────────────
+    Workflow:
+      1. Load RAW data
+      2. Split (60/20/20)
+      3. PREPROCESSING (DateFeatureExtractor → MissingValueHandler → 
+                        CategoricalEncoder → StandardScaler)
+         → Result: 21 features
+      4. FA FEATURE SELECTION (Firefly Algorithm)
+         - n_fireflies=40, n_epochs=10
+         - Select ~15 most important features
+         → Result: 15 selected features
+      5. RESAMPLING (TRAIN SET ONLY!)
+         - BorderlineSMOTE (sampling_strategy=0.1)
+         - EditedNearestNeighbours
+      6. OPTUNA HYPERPARAMETER TUNING (50 trials)
+      7. TRAIN FINAL XGBOOST MODEL (with optimized params)
+      8. THRESHOLD OPTIMIZATION (on Validation set)
+      9. Complete Pipeline → Save Model → Evaluation
+    
+    Expected:
+      - Uses only 15 most important features
+      - Better generalization (less overfitting)
+      - Higher Precision & F1-Score
+      - Faster inference (fewer features)
+    
+    ════════════════════════════════════════════════════════════════════════
+    📈 COMPARISON METRICS
+    ════════════════════════════════════════════════════════════════════════
+    Compare these metrics between the two modes:
+      - ROC-AUC, PR-AUC
+      - Precision, Recall, F1-Score
+      - Val-Test gap (overfitting check)
+      - Training time
+      - Number of features used
+      - Optimal threshold
+    
+    ════════════════════════════════════════════════════════════════════════
     """
     
     # ========== VÍ DỤ SỬ DỤNG ==========
     
-    # Ví dụ 1: Chạy XGBoost + SMOTEENN (KHÔNG Feature Selection)
+    # Ví dụ 1: Chạy XGBoost + SMOTEENN (NO Feature Selection - ALL 21 features)
     # pipeline = main(mode='xgboost_smoteenn')
     
-    # Ví dụ 2: Chạy XGBoost + FA + SMOTEENN + Optuna + Threshold Tuning (RECOMMENDED)
+    # Ví dụ 2: Chạy XGBoost + FA + SMOTEENN (WITH FA - 15 features) - RECOMMENDED
     pipeline = main(mode='xgboost_fa_smoteenn')
     
-    # Để thay đổi FA config, sửa trực tiếp trong hàm main() ở dòng fa_config = FAConfig(...)
+    # Để so sánh 2 modes, chạy cả 2 và so sánh file results_no_leakage.json
