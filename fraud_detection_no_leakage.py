@@ -1,6 +1,4 @@
-# =========================
-# FRAUD DETECTION - NO DATA LEAKAGE VERSION
-# =========================
+# Fraud Detection - No Data Leakage Version
 
 import pandas as pd
 import numpy as np
@@ -8,8 +6,12 @@ import json
 import os
 import time
 import warnings
+import subprocess
+import math
 from typing import Tuple, Dict
 from dataclasses import dataclass
+from sklearn.base import BaseEstimator, TransformerMixin
+from PIL import Image
 
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.model_selection import train_test_split
@@ -29,58 +31,46 @@ import joblib
 warnings.filterwarnings("ignore")
 
 
-# ============================================================================
-# CONFIGURATION - FEATURE SELECTION (FA)
-# ============================================================================
+# Configuration - Feature Selection (FA)
 
 @dataclass
 class FAConfig:
-    """Configuration cho Feature Selection (simulating Firefly Algorithm)"""
-    
-    # Feature selection parameters
-    selection_ratio: float = 0.7           # Tỷ lệ features được chọn (70%)
-    min_feature_ratio: float = 0.6         # Tối thiểu 60% features
-    max_feature_ratio: float = 0.8         # Tối đa 80% features
-    min_feature_count: int = 8             # Tối thiểu 8 features
-    
-    # Random seed
+    """Configuration for Firefly Algorithm Feature Selection"""
+    selection_ratio: float = 0.7
+    min_feature_ratio: float = 0.6
+    max_feature_ratio: float = 0.8
+    min_feature_count: int = 10
     random_state: int = 42
-    
-    # Selection mode
-    feature_selection_mode: str = "importance"  # "random", "importance", "correlation"
-    
-    # Advanced options (for future FA implementation)
-    n_fireflies: int = 30                  # Số fireflies (nếu implement full FA)
-    n_epochs: int = 15                     # Số epochs (nếu implement full FA)
-    alpha: float = 0.25                    # Exploration rate
-    beta0: float = 2.0                     # Attraction coefficient
-    gamma: float = 0.20                    # Light absorption coefficient
-    lambda_feat: float = 0.01              # Feature penalty
-    diversity_threshold: float = 0.1       # Diversity preservation threshold
-    patience: int = 6                      # Early stopping patience
-    validation_strictness: float = 0.8     # Validation strictness
-    overfitting_threshold: float = 0.03    # Overfitting threshold
+    feature_selection_mode: str = "importance"
+    fa_variant: str = "alfa"  # standard | lfa | afa | alfa
+    n_fireflies: int = 30
+    n_epochs: int = 15
+    alpha: float = 0.25
+    alpha_decay: float = 0.95
+    beta_decay: float = 0.92
+    beta0: float = 2.0
+    gamma: float = 0.20
+    levy_beta: float = 1.5
+    levy_scale: float = 0.1
+    lambda_feat: float = 0.01
+    diversity_threshold: float = 0.1
+    patience: int = 6
+    validation_strictness: float = 0.8
+    overfitting_threshold: float = 0.03
 
 
-# ============================================================================
-# PHẦN 1: LOAD DATA - KHÔNG PREPROCESSING
-# ============================================================================
+# Data Loading
 
 def load_raw_data(filepath: str) -> Tuple[pd.DataFrame, pd.Series]:
-    """
-    Load dữ liệu RAW - KHÔNG tiền xử lý để tránh data leakage
-    """
-    print("[INFO] Loading RAW data from:", filepath)
+    """Load raw data without preprocessing to avoid data leakage"""
+    print("Loading data from:", filepath)
     df = pd.read_csv(filepath)
     
-    print("Shape ban đầu:", df.shape)
+    print("Initial shape:", df.shape)
     print("\nTarget distribution:\n", df['is_fraud'].value_counts(normalize=True))
     
-    # Chỉ drop các cột không cần thiết
     cols_to_drop = ['index', 'Unnamed: 0', 'trans_num']
     df.drop(cols_to_drop, axis=1, inplace=True, errors='ignore')
-    
-    # Tách target
     y = df['is_fraud']
     X = df.drop('is_fraud', axis=1)
     
@@ -89,15 +79,10 @@ def load_raw_data(filepath: str) -> Tuple[pd.DataFrame, pd.Series]:
     
     return X, y
 
-
-# ============================================================================
-# PHẦN 2: FEATURE ENGINEERING - TRONG PIPELINE
-# ============================================================================
-
-from sklearn.base import BaseEstimator, TransformerMixin
+# Feature Engineering
 
 class DateFeatureExtractor(BaseEstimator, TransformerMixin):
-    """Extract features từ datetime columns"""
+    """Extract features from datetime columns"""
     
     def fit(self, X, y=None):
         return self
@@ -105,17 +90,13 @@ class DateFeatureExtractor(BaseEstimator, TransformerMixin):
     def transform(self, X):
         X = X.copy()
         
-        # Convert datetime
         X['trans_date_trans_time'] = pd.to_datetime(X['trans_date_trans_time'])
         X['dob'] = pd.to_datetime(X['dob'])
         
-        # Extract features
         X['transaction_hour'] = X['trans_date_trans_time'].dt.hour
         X['transaction_day'] = X['trans_date_trans_time'].dt.dayofweek
         X['transaction_month'] = X['trans_date_trans_time'].dt.month
         X['age'] = (X['trans_date_trans_time'] - X['dob']).dt.days // 365
-        
-        # Drop original datetime columns
         X.drop(['trans_date_trans_time', 'dob', 'unix_time'], axis=1, inplace=True, errors='ignore')
         
         return X
@@ -129,11 +110,7 @@ class CategoricalEncoder(BaseEstimator, TransformerMixin):
     
     def fit(self, X, y=None):
         X = X.copy()
-        
-        # Identify categorical columns
         cat_cols = X.select_dtypes(include=['object']).columns.tolist()
-        
-        # Fit label encoders
         for col in cat_cols:
             le = LabelEncoder()
             # Handle missing values
@@ -145,8 +122,6 @@ class CategoricalEncoder(BaseEstimator, TransformerMixin):
     
     def transform(self, X):
         X = X.copy()
-        
-        # Transform using fitted encoders
         for col, le in self.label_encoders.items():
             if col in X.columns:
                 X[col] = X[col].fillna('unknown')
@@ -167,8 +142,6 @@ class MissingValueHandler(BaseEstimator, TransformerMixin):
     
     def fit(self, X, y=None):
         X = X.copy()
-        
-        # For numeric columns, use median
         num_cols = X.select_dtypes(include=[np.number]).columns
         for col in num_cols:
             self.fill_values[col] = X[col].median()
@@ -177,8 +150,6 @@ class MissingValueHandler(BaseEstimator, TransformerMixin):
     
     def transform(self, X):
         X = X.copy()
-        
-        # Fill numeric missing values
         for col, fill_val in self.fill_values.items():
             if col in X.columns:
                 X[col] = X[col].fillna(fill_val)
@@ -186,20 +157,13 @@ class MissingValueHandler(BaseEstimator, TransformerMixin):
         return X
 
 
-# ============================================================================
-# PHẦN 3: CREATE PIPELINE - NO LEAKAGE
-# ============================================================================
+# Pipeline Creation
 
 class FeatureSelector(BaseEstimator, TransformerMixin):
     """Feature Selection using FULL Firefly Algorithm"""
     
     def __init__(self, config: FAConfig = None):
-        """
-        Initialize FeatureSelector with FAConfig
-        
-        Args:
-            config: FAConfig instance cho các tham số feature selection
-        """
+        """Initialize FeatureSelector with FAConfig"""
         if config is None:
             config = FAConfig()
         
@@ -209,13 +173,21 @@ class FeatureSelector(BaseEstimator, TransformerMixin):
         self.min_feature_ratio = config.min_feature_ratio
         self.max_feature_ratio = config.max_feature_ratio
         self.min_feature_count = config.min_feature_count
+        self.fa_variant = config.fa_variant.lower()
+        if self.fa_variant not in ['standard', 'lfa', 'afa', 'alfa']:
+            print(f"[WARN] Unknown FA variant '{self.fa_variant}', fallback to standard")
+            self.fa_variant = 'standard'
         
         # FA parameters
         self.n_fireflies = config.n_fireflies
         self.n_epochs = config.n_epochs
         self.alpha = config.alpha
+        self.alpha_decay = config.alpha_decay
+        self.beta_decay = config.beta_decay
         self.beta0 = config.beta0
         self.gamma = config.gamma
+        self.levy_beta = config.levy_beta
+        self.levy_scale = config.levy_scale
         self.lambda_feat = config.lambda_feat
         self.diversity_threshold = config.diversity_threshold
         self.patience = config.patience
@@ -282,17 +254,31 @@ class FeatureSelector(BaseEstimator, TransformerMixin):
         """Calculate Euclidean distance between two fireflies"""
         return np.sqrt(np.sum((firefly_i - firefly_j) ** 2))
     
-    def _attractiveness(self, distance):
+    def _attractiveness(self, distance, beta0_override=None):
         """Calculate attractiveness based on distance"""
-        return self.beta0 * np.exp(-self.gamma * distance ** 2)
+        base_beta0 = beta0_override if beta0_override is not None else self.beta0
+        return base_beta0 * np.exp(-self.gamma * distance ** 2)
+
+    def _levy_flight_step(self, dim):
+        """Generate Lévy flight step using Mantegna's algorithm (heavy-tailed jumps)"""
+        beta = self.levy_beta
+        sigma_u = (
+            math.gamma(1 + beta)
+            * math.sin(math.pi * beta / 2)
+            / (math.gamma((1 + beta) / 2) * beta * (2 ** ((beta - 1) / 2)))
+        ) ** (1 / beta)
+        u = np.random.normal(0, sigma_u, size=dim)
+        v = np.random.normal(0, 1, size=dim)
+        step = u / ((np.abs(v) ** (1 / beta)) + 1e-12)
+        return self.levy_scale * step
     
-    def _move_firefly(self, firefly_i, firefly_j, alpha):
-        """Move firefly i towards firefly j"""
+    def _move_firefly(self, firefly_i, firefly_j, alpha, beta0_override=None, use_levy=False):
+        """Move firefly i towards firefly j with optional Lévy flight and adaptive beta"""
         distance = self._distance(firefly_i, firefly_j)
-        beta = self._attractiveness(distance)
+        beta = self._attractiveness(distance, beta0_override=beta0_override)
         
-        # Movement equation
-        random_vector = np.random.rand(len(firefly_i)) - 0.5
+        # Movement equation with selectable exploration noise
+        random_vector = self._levy_flight_step(len(firefly_i)) if use_levy else (np.random.rand(len(firefly_i)) - 0.5)
         new_position = firefly_i + beta * (firefly_j - firefly_i) + alpha * random_vector
         
         # Convert to binary (0 or 1)
@@ -345,7 +331,7 @@ class FeatureSelector(BaseEstimator, TransformerMixin):
         
         n_features = len(self.feature_names_)
         
-        print(f"\n[INFO] Feature names after transformation: {self.feature_names_[:10]}... ({n_features} total)")
+        print(f"\nFeature names: {self.feature_names_[:10]}... ({n_features} total)")
         
         # Calculate target number of features
         min_features = max(self.min_feature_count, int(n_features * self.min_feature_ratio))
@@ -353,21 +339,23 @@ class FeatureSelector(BaseEstimator, TransformerMixin):
         target_n_features = int(n_features * self.selection_ratio)
         target_n_features = max(min_features, min(target_n_features, max_features))
         
-        print(f"\n[INFO] FA Configuration:")
+        print(f"\nFA Configuration:")
+        print(f"  - Variant: {self.fa_variant.upper()} (standard | LFA | AFA | ALFA)")
         print(f"  - Total features: {n_features}")
         print(f"  - Target features: {target_n_features} ({self.selection_ratio:.1%})")
         print(f"  - Fireflies: {self.n_fireflies}")
         print(f"  - Epochs: {self.n_epochs}")
-        print(f"  - Alpha (randomness): {self.alpha}")
-        print(f"  - Beta0 (attraction): {self.beta0}")
+        print(f"  - Alpha (randomness): {self.alpha} (decay={self.alpha_decay})")
+        print(f"  - Beta0 (attraction): {self.beta0} (decay={self.beta_decay if self.fa_variant in ['afa', 'alfa'] else 'none'})")
         print(f"  - Gamma (absorption): {self.gamma}")
-        print(f"\n[INFO] ⏳ Initializing {self.n_fireflies} fireflies (this may take 1-2 minutes)...")
-        print(f"       Each firefly requires XGBoost training with 3-fold CV")
+        if self.fa_variant in ['lfa', 'alfa']:
+            print(f"  - Lévy flight: beta={self.levy_beta}, scale={self.levy_scale}")
+        print(f"\nInitializing {self.n_fireflies} fireflies (may take 1-2 minutes)...")
+        print(f"Each firefly requires XGBoost training with 3-fold CV")
         
-        # Initialize firefly population
         fireflies = self._initialize_fireflies(n_features, target_n_features)
         
-        print(f"[INFO] 🔥 Evaluating initial population...")
+        print("Evaluating initial population...")
         fitness_values = []
         for idx, f in enumerate(fireflies):
             fitness = self._calculate_fitness(f, X_array, y)
@@ -381,11 +369,11 @@ class FeatureSelector(BaseEstimator, TransformerMixin):
         best_firefly = fireflies[best_idx].copy()
         self.best_fitness_ = fitness_values[best_idx]
         
-        print(f"\n[INFO] ✅ Initial population ready!")
-        print(f"  - Best fitness: {self.best_fitness_:.4f}")
-        print(f"  - Features selected: {int(best_firefly.sum())}")
-        print(f"\n[INFO] 🚀 Starting FA optimization ({self.n_epochs} epochs)...")
-        print(f"       Estimated time: ~{self.n_epochs * 2}-{self.n_epochs * 3} minutes")
+        print(f"\nInitial population ready!")
+        print(f"  Best fitness: {self.best_fitness_:.4f}")
+        print(f"  Features selected: {int(best_firefly.sum())}")
+        print(f"\nStarting FA optimization ({self.n_epochs} epochs)...")
+        print(f"Estimated time: ~{self.n_epochs * 2}-{self.n_epochs * 3} minutes")
         
         # Early stopping
         no_improvement = 0
@@ -395,11 +383,13 @@ class FeatureSelector(BaseEstimator, TransformerMixin):
             epoch_start_time = time.time()
             
             print(f"\n{'='*60}")
-            print(f"📍 EPOCH {epoch+1}/{self.n_epochs}")
+            print(f"EPOCH {epoch+1}/{self.n_epochs}")
             print(f"{'='*60}")
             
-            # Update alpha (decrease over time)
-            alpha_t = self.alpha * (0.95 ** epoch)
+            # Adaptive alpha/beta per variant
+            alpha_t = self.alpha * (self.alpha_decay ** epoch)
+            beta0_t = self.beta0 * (self.beta_decay ** epoch) if self.fa_variant in ['afa', 'alfa'] else self.beta0
+            use_levy = self.fa_variant in ['lfa', 'alfa']
             
             # Track evaluations in this epoch
             evaluations_count = 0
@@ -411,7 +401,13 @@ class FeatureSelector(BaseEstimator, TransformerMixin):
                 for j in range(self.n_fireflies):
                     if fitness_values[j] > fitness_values[i]:
                         # Move firefly i towards brighter firefly j
-                        fireflies[i] = self._move_firefly(fireflies[i], fireflies[j], alpha_t)
+                        fireflies[i] = self._move_firefly(
+                            fireflies[i],
+                            fireflies[j],
+                            alpha_t,
+                            beta0_override=beta0_t,
+                            use_levy=use_levy
+                        )
                         
                         # Recalculate fitness
                         fitness_values[i] = self._calculate_fitness(fireflies[i], X_array, y)
@@ -420,7 +416,7 @@ class FeatureSelector(BaseEstimator, TransformerMixin):
                 
                 # Progress update every 10 fireflies
                 if (i + 1) % 10 == 0:
-                    print(f"  🔄 Processed {i+1}/{self.n_fireflies} fireflies ({evaluations_count} evaluations)")
+                    print(f"  Processed {i+1}/{self.n_fireflies} fireflies ({evaluations_count} evaluations)")
             
             # Update best solution
             current_best_idx = np.argmax(fitness_values)
@@ -433,22 +429,22 @@ class FeatureSelector(BaseEstimator, TransformerMixin):
                 self.best_fitness_ = current_best_fitness
                 best_firefly = fireflies[current_best_idx].copy()
                 no_improvement = 0
-                print(f"\n  ✨ NEW BEST FITNESS: {self.best_fitness_:.4f} (+{improvement:.4f})")
-                print(f"     Features: {int(best_firefly.sum())}/{n_features}")
-                print(f"     Time: {epoch_time:.1f}s")
+                print(f"\n  NEW BEST FITNESS: {self.best_fitness_:.4f} (+{improvement:.4f})")
+                print(f"  Features: {int(best_firefly.sum())}/{n_features}")
+                print(f"  Time: {epoch_time:.1f}s")
             else:
                 no_improvement += 1
-                print(f"\n  ⏸️  No improvement (fitness: {self.best_fitness_:.4f})")
-                print(f"     Patience: {no_improvement}/{self.patience}")
-                print(f"     Time: {epoch_time:.1f}s")
+                print(f"\n  No improvement (fitness: {self.best_fitness_:.4f})")
+                print(f"  Patience: {no_improvement}/{self.patience}")
+                print(f"  Time: {epoch_time:.1f}s")
             
             self.fitness_history_.append(self.best_fitness_)
             
             # Ensure diversity every few epochs
             if (epoch + 1) % 5 == 0:
-                print(f"\n  🔀 Ensuring population diversity...")
+                print(f"\n  Ensuring population diversity...")
                 fireflies = self._ensure_diversity(fireflies)
-                print(f"     Re-evaluating {self.n_fireflies} fireflies...")
+                print(f"  Re-evaluating {self.n_fireflies} fireflies...")
                 fitness_values = []
                 for idx, f in enumerate(fireflies):
                     fitness_values.append(self._calculate_fitness(f, X_array, y))
@@ -459,8 +455,8 @@ class FeatureSelector(BaseEstimator, TransformerMixin):
             # Early stopping
             if no_improvement >= self.patience:
                 print(f"\n{'='*60}")
-                print(f"⏹️  EARLY STOPPING at epoch {epoch+1}")
-                print(f"    No improvement for {self.patience} consecutive epochs")
+                print(f"EARLY STOPPING at epoch {epoch+1}")
+                print(f"No improvement for {self.patience} consecutive epochs")
                 print(f"{'='*60}")
                 break
         
@@ -468,10 +464,10 @@ class FeatureSelector(BaseEstimator, TransformerMixin):
         selected_indices = best_firefly > 0.5
         self.selected_features_ = [self.feature_names_[i] for i in range(n_features) if selected_indices[i]]
         
-        print(f"\n[INFO] ✅ Feature Selection Complete!")
-        print(f"  - Final fitness: {self.best_fitness_:.4f}")
-        print(f"  - Selected: {len(self.selected_features_)}/{n_features} features")
-        print(f"  - Selection ratio: {len(self.selected_features_)/n_features:.1%}")
+        print(f"\nFeature Selection Complete!")
+        print(f"  Final fitness: {self.best_fitness_:.4f}")
+        print(f"  Selected: {len(self.selected_features_)}/{n_features} features")
+        print(f"  Selection ratio: {len(self.selected_features_)/n_features:.1%}")
         print("="*60 + "\n")
         
         return self
@@ -487,14 +483,7 @@ class FeatureSelector(BaseEstimator, TransformerMixin):
 
 
 def create_training_pipeline(random_state=42, use_feature_selection=False, fa_config=None):
-    """
-    Tạo pipeline training KHÔNG có data leakage
-    
-    Args:
-        random_state: Random seed
-        use_feature_selection: Nếu True, sử dụng Feature Selection (FA mode)
-        fa_config: FAConfig instance cho feature selection (optional)
-    """
+    """Create training pipeline without data leakage"""
     
     # Check GPU availability
     gpu_available = False
@@ -503,83 +492,81 @@ def create_training_pipeline(random_state=42, use_feature_selection=False, fa_co
         result = subprocess.run(['nvidia-smi'], capture_output=True, text=True, timeout=5)
         if result.returncode == 0:
             gpu_available = True
-            print("[INFO] 🚀 GPU detected! XGBoost will use GPU acceleration (tree_method='gpu_hist')")
+            print("GPU detected - using GPU acceleration")
         else:
-            print("[INFO] ⚠️  No GPU detected. XGBoost will use CPU (tree_method='hist')")
+            print("No GPU detected - using CPU")
     except:
-        print("[INFO] ⚠️  GPU check failed. XGBoost will use CPU (tree_method='hist')")
+        print("GPU check failed - using CPU")
     
     steps = [
-        # Step 1: Extract date features
         ('date_features', DateFeatureExtractor()),
-        
-        # Step 2: Handle missing values
         ('missing_handler', MissingValueHandler()),
-        
-        # Step 3: Encode categorical
+        # SMOTE cần dữ liệu số ⇒ mã hóa trước khi resample
         ('categorical_encoder', CategoricalEncoder()),
-        
-        # Step 4: Scale numerical features
         ('scaler', StandardScaler()),
+        # Xử lý mất cân bằng ngay sau khi có đặc trưng số
+        ('smote', BorderlineSMOTE(
+            random_state=random_state,
+            k_neighbors=5,
+            sampling_strategy=0.1
+        )),
+        ('enn', EditedNearestNeighbours(
+            n_neighbors=3,
+            sampling_strategy='auto'
+        )),
     ]
-    
-    # Step 5: Feature Selection (chỉ khi use_feature_selection=True)
+
     if use_feature_selection:
         if fa_config is None:
-            fa_config = FAConfig()  # Sử dụng default config
-        
+            fa_config = FAConfig()
+        # Feature selection sau SMOTE/ENN để chọn trên phân phối đã cân bằng
         steps.append(('feature_selector', FeatureSelector(config=fa_config)))
-    
+
     # Configure XGBoost for GPU or CPU
     if gpu_available:
         xgb_params = {
             'objective': 'binary:logistic',
-            'tree_method': 'gpu_hist',  # GPU acceleration
-            'device': 'cuda',            # Use CUDA
-            'n_estimators': 250,         # Giảm nhẹ: 300 → 250
-            'learning_rate': 0.04,       # Giảm nhẹ: 0.05 → 0.04
-            'max_depth': 5,              # Giữ nguyên
+            'tree_method': 'gpu_hist',
+            'device': 'cuda',
+            'n_estimators': 250,
+            'learning_rate': 0.04,
+            'max_depth': 5,
             'subsample': 0.8,
             'colsample_bytree': 0.8,
-            'reg_alpha': 3.0,            # Tăng nhẹ: 2.0 → 3.0
-            'reg_lambda': 6.0,           # Tăng nhẹ: 5.0 → 6.0
-            'min_child_weight': 6.0,     # Tăng nhẹ: 5.0 → 6.0
+            'reg_alpha': 3.0,
+            'reg_lambda': 6.0,
+            'min_child_weight': 6.0,
             'eval_metric': 'aucpr',
             'random_state': random_state
         }
     else:
         xgb_params = {
             'objective': 'binary:logistic',
-            'tree_method': 'hist',      # CPU histogram algorithm
-            'device': 'cpu',             # Use CPU
-            'n_estimators': 250,         # Giảm nhẹ: 300 → 250
-            'learning_rate': 0.04,       # Giảm nhẹ: 0.05 → 0.04
-            'max_depth': 5,              # Giữ nguyên
+            'tree_method': 'hist',
+            'device': 'cpu',
+            'n_estimators': 250,
+            'learning_rate': 0.04,
+            'max_depth': 5,
             'subsample': 0.8,
             'colsample_bytree': 0.8,
-            'reg_alpha': 3.0,            # Tăng nhẹ: 2.0 → 3.0
-            'reg_lambda': 6.0,           # Tăng nhẹ: 5.0 → 6.0
-            'min_child_weight': 6.0,     # Tăng nhẹ: 5.0 → 6.0
+            'reg_alpha': 3.0,
+            'reg_lambda': 6.0,
+            'min_child_weight': 6.0,
             'eval_metric': 'aucpr',
             'random_state': random_state,
-            'n_jobs': -1                 # Use all CPU cores
+            'n_jobs': -1
         }
     
-    # Step 6: Resampling
     steps.extend([
         ('smote', BorderlineSMOTE(
             random_state=random_state,
             k_neighbors=5,
-            sampling_strategy=0.1  # Chỉ tăng minority class lên 10% của majority
+            sampling_strategy=0.1
         )),
-        
-        # Step 7: ENN cleaning
         ('enn', EditedNearestNeighbours(
             n_neighbors=3,
             sampling_strategy='auto'
         )),
-        
-        # Step 8: XGBoost classifier with GPU/CPU config
         ('classifier', XGBClassifier(**xgb_params))
     ])
     
@@ -588,12 +575,10 @@ def create_training_pipeline(random_state=42, use_feature_selection=False, fa_co
     return pipeline
 
 
-# ============================================================================
-# PHẦN 4: TRAINING & EVALUATION
-# ============================================================================
+# Training & Evaluation
 
 def evaluate_model(pipeline, X, y, dataset_name="Dataset"):
-    """Evaluate model trên dataset"""
+    """Evaluate model performance"""
     
     y_proba = pipeline.predict_proba(X)[:, 1]
     y_pred = pipeline.predict(X)
@@ -622,17 +607,7 @@ def evaluate_model(pipeline, X, y, dataset_name="Dataset"):
 
 
 def find_optimal_threshold(y_true, y_proba, metric='f1'):
-    """
-    Find optimal threshold to maximize a specific metric
-    
-    Args:
-        y_true: True labels
-        y_proba: Predicted probabilities
-        metric: 'f1', 'precision', or 'recall'
-    
-    Returns:
-        optimal_threshold, best_score, metrics_dict
-    """
+
     precisions, recalls, thresholds = precision_recall_curve(y_true, y_proba)
     
     # Calculate F1 for each threshold
@@ -700,6 +675,19 @@ def evaluate_model_with_threshold(pipeline, X, y, threshold=0.5, dataset_name="D
     }
 
 
+def display_image(image_path):
+    """Display image inline or open with default viewer"""
+    try:
+        if os.path.exists(image_path):
+            img = Image.open(image_path)
+            img.show()
+            print(f"Opened image: {image_path}")
+        else:
+            print(f"Image not found: {image_path}")
+    except Exception as e:
+        print(f"Could not display image {image_path}: {e}")
+
+
 def plot_curves(results_dict, out_dir='outputs'):
     """Plot ROC và PR curves"""
     
@@ -738,19 +726,11 @@ def plot_curves(results_dict, out_dir='outputs'):
     plt.savefig(os.path.join(out_dir, 'roc_pr_curves_no_leakage.png'), dpi=150)
     plt.close()
     
-    print(f"\n[INFO] Saved curves to {out_dir}/roc_pr_curves_no_leakage.png")
+    print(f"\nSaved curves to {out_dir}/roc_pr_curves_no_leakage.png")
 
 
 def plot_feature_importance(pipeline, feature_names, out_dir='outputs', top_n=20):
-    """
-    Plot feature importance from XGBoost classifier
-    
-    Args:
-        pipeline: Trained pipeline containing XGBoost
-        feature_names: List of feature names (after all transformations)
-        out_dir: Output directory
-        top_n: Number of top features to display
-    """
+
     os.makedirs(out_dir, exist_ok=True)
     
     # Get XGBoost classifier from pipeline
@@ -805,37 +785,22 @@ def plot_feature_importance(pipeline, feature_names, out_dir='outputs', top_n=20
     return importance_df
 
 
-# ============================================================================
-# PHẦN 4.5: OPTUNA HYPERPARAMETER TUNING
-# ============================================================================
+# Hyperparameter Tuning
 
 def tune_xgboost_with_optuna(X_train, y_train, X_val, y_val, n_trials=50, use_gpu=False):
-    """
-    Tune XGBoost hyperparameters using Optuna
-    
-    Args:
-        X_train: Training features (already preprocessed & resampled)
-        y_train: Training labels
-        X_val: Validation features
-        y_val: Validation labels
-        n_trials: Number of Optuna trials
-        use_gpu: Whether to use GPU
-    
-    Returns:
-        best_params: Dict of best hyperparameters
-    """
+
     try:
         import optuna
         from optuna.samplers import TPESampler
     except ImportError:
         print("[WARNING] Optuna not installed. Skipping hyperparameter tuning.")
-        print("[INFO] Using default hyperparameters instead.")
+        print("Using default hyperparameters instead")
         return None
     
     print("\n" + "="*60)
-    print(" OPTUNA - HYPERPARAMETER TUNING ")
+    print(" OPTUNA HYPERPARAMETER TUNING ")
     print("="*60)
-    print(f"[INFO] Running {n_trials} trials to find optimal XGBoost params...")
+    print(f"Running {n_trials} trials...")
     
     def objective(trial):
         """Optuna objective function"""
@@ -844,8 +809,6 @@ def tune_xgboost_with_optuna(X_train, y_train, X_val, y_val, n_trials=50, use_gp
             'eval_metric': 'aucpr',
             'random_state': 42,
             'verbosity': 0,
-            
-            # Tunable parameters
             'n_estimators': trial.suggest_int('n_estimators', 100, 500),
             'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
             'max_depth': trial.suggest_int('max_depth', 3, 8),
@@ -857,7 +820,6 @@ def tune_xgboost_with_optuna(X_train, y_train, X_val, y_val, n_trials=50, use_gp
             'gamma': trial.suggest_float('gamma', 0.0, 5.0),
         }
         
-        # GPU/CPU config
         if use_gpu:
             params['tree_method'] = 'gpu_hist'
             params['device'] = 'cuda'
@@ -866,30 +828,22 @@ def tune_xgboost_with_optuna(X_train, y_train, X_val, y_val, n_trials=50, use_gp
             params['device'] = 'cpu'
             params['n_jobs'] = -1
         
-        # Train model
         clf = XGBClassifier(**params)
         clf.fit(X_train, y_train)
-        
-        # Evaluate on validation set
         y_val_proba = clf.predict_proba(X_val)[:, 1]
         pr_auc = average_precision_score(y_val, y_val_proba)
         
         return pr_auc
     
-    # Create study
     sampler = TPESampler(seed=42)
     study = optuna.create_study(direction='maximize', sampler=sampler)
-    
-    # Optimize
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
-    
-    # Get best parameters
     best_params = study.best_params
     best_score = study.best_value
     
-    print(f"\n[INFO] ✅ Optuna tuning complete!")
-    print(f"  - Best PR-AUC: {best_score:.4f}")
-    print(f"  - Best parameters:")
+    print(f"\nOptuna tuning complete!")
+    print(f"  Best PR-AUC: {best_score:.4f}")
+    print(f"  Best parameters:")
     for key, value in best_params.items():
         print(f"    {key}: {value}")
     print("="*60 + "\n")
@@ -897,15 +851,10 @@ def tune_xgboost_with_optuna(X_train, y_train, X_val, y_val, n_trials=50, use_gp
     return best_params
 
 
-# ============================================================================
-# PHẦN 4.6: FRAUD DETECTION PIPELINE WRAPPER
-# ============================================================================
+# Pipeline Wrappers
 
 class FraudDetectionPipeline:
-    """
-    Complete fraud detection pipeline wrapper
-    Combines preprocessing + classifier + optimal threshold
-    """
+    """Complete fraud detection pipeline with preprocessing + classifier + threshold"""
     def __init__(self, preprocessor, classifier, threshold=0.5):
         self.preprocessor = preprocessor
         self.classifier = classifier
@@ -930,20 +879,30 @@ class FraudDetectionPipeline:
         }
 
 
-# ============================================================================
-# PHẦN 5: MAIN TRAINING
-# ============================================================================
+class FullPreprocessingPipeline:
+    """Wrapper combining preprocessing + feature selection"""
+    def __init__(self, preprocessor, feature_selector):
+        self.preprocessor = preprocessor
+        self.feature_selector = feature_selector
+    
+    def transform(self, X):
+        """Apply preprocessing then feature selection"""
+        X_processed = self.preprocessor.transform(X)
+        
+        if not isinstance(X_processed, pd.DataFrame):
+            feature_names = self.feature_selector.feature_names_
+            X_processed = pd.DataFrame(X_processed, columns=feature_names)
+        X_selected = X_processed[self.feature_selector.selected_features_]
+        return X_selected
+
+
+# Main Training Function
 
 def main(mode: str = 'xgboost_smoteenn'):
-    """
-    Main training function - NO DATA LEAKAGE
-    
-    Args:
-        mode: 'xgboost_smoteenn' hoặc 'xgboost_fa_smoteenn'
-    """
+    """Main training function without data leakage"""
     
     print("\n" + "="*80)
-    print(" FRAUD DETECTION - NO DATA LEAKAGE VERSION ")
+    print(" FRAUD DETECTION - NO DATA LEAKAGE ")
     print("="*80)
     print(f"Mode: {mode.upper()}")
     print("="*80 + "\n")
@@ -956,37 +915,31 @@ def main(mode: str = 'xgboost_smoteenn'):
     data_path = '/kaggle/input/fraud-detection/fraudTrain.csv'  # Sử dụng fraudTrain.csv để so sánh fair
     X, y = load_raw_data(data_path)
     
-    # FA Config (chỉ dùng khi mode = xgboost_fa_smoteenn)
     fa_config = FAConfig(
-        selection_ratio=0.6,
-        min_feature_ratio=0.5,
-        max_feature_ratio=0.7,
-        min_feature_count=10,
-        n_fireflies=40,        
-        n_epochs=10,           
-        patience=4,            
+        selection_ratio=0.7,         # Tăng 0.6 → 0.8 (giữ nhiều features hơn)
+        min_feature_ratio=0.6,       # Tăng 0.5 → 0.7 (tối thiểu 70% features)
+        max_feature_ratio=0.8,       # Tăng 0.7 → 0.9 (tối đa 90% features)
+        min_feature_count=12,        # Tăng 10 → 15 (giữ ít nhất 15 features)
+        n_fireflies=30,              # Tăng 40 → 50 (population lớn hơn)
+        n_epochs=10,                 # Tăng 10 → 15 (nhiều epochs hơn)
+        patience=4,                  # Tăng 4 → 6 (kiên nhẫn hơn)
+        fa_variant="alfa",          # Mặc định dùng Adaptive + Lévy
         random_state=42
     )
     
-    # ========================================
-    # CRITICAL: Split FIRST, then preprocess
-    # ========================================
-    
-    print("\n[STEP 1] Splitting data (Train 60% / Val 20% / Test 20%)")
+    print("\nSplitting data (Train 60% / Val 20% / Test 20%)")
     print("="*60)
     
-    # First split: Train vs (Val + Test)
     X_train, X_temp, y_train, y_temp = train_test_split(
         X, y, 
-        test_size=0.4,  # 40% cho val+test
+        test_size=0.4,
         random_state=42, 
         stratify=y
     )
     
-    # Second split: Val vs Test (chia đều 20% mỗi phần)
     X_val, X_test, y_val, y_test = train_test_split(
         X_temp, y_temp,
-        test_size=0.5,  # 50% của 40% = 20%
+        test_size=0.5,
         random_state=42,
         stratify=y_temp
     )
@@ -995,19 +948,14 @@ def main(mode: str = 'xgboost_smoteenn'):
     print(f"Val:   {X_val.shape}, fraud rate: {y_val.mean():.4f}")
     print(f"Test:  {X_test.shape}, fraud rate: {y_test.mean():.4f}")
     
-    # ========================================
-    # MODE: XGBoost + SMOTEENN (NO Feature Selection)
-    # ========================================
-    
     if mode == 'xgboost_smoteenn':
         print("\n" + "="*80)
-        print(" XGBOOST + SMOTEENN (NO Feature Selection - Use ALL 21 Features) ")
+        print(" XGBOOST + SMOTEENN (NO FEATURE SELECTION) ")
         print("="*80)
         
         start_time = time.time()
         
-        # STEP 1: Create preprocessing pipeline (NO resampling, NO classifier)
-        print("\n[STEP 1] Creating preprocessing pipeline...")
+        print("\nCreating preprocessing pipeline...")
         pipeline_steps = [
             ('date_features', DateFeatureExtractor()),
             ('missing_handler', MissingValueHandler()),
@@ -1018,8 +966,7 @@ def main(mode: str = 'xgboost_smoteenn'):
         from sklearn.pipeline import Pipeline as SkPipeline
         preprocessing_pipeline = SkPipeline(pipeline_steps)
         
-        # Fit preprocessing
-        print("[STEP 1.1] Running preprocessing on all sets...")
+        print("Running preprocessing on all sets...")
         X_train_processed = preprocessing_pipeline.fit_transform(X_train)
         X_val_processed = preprocessing_pipeline.transform(X_val)
         X_test_processed = preprocessing_pipeline.transform(X_test)
@@ -1031,11 +978,10 @@ def main(mode: str = 'xgboost_smoteenn'):
             all_features = [f"feature_{i}" for i in range(X_train_processed.shape[1])]
         
         total_features = len(all_features)
-        print(f"\n[INFO] Total features after preprocessing: {total_features}")
-        print(f"[INFO] Using ALL features (no feature selection)")
+        print(f"\nTotal features: {total_features}")
+        print(f"Using ALL features (no feature selection)")
         
-        # STEP 2: Apply SMOTE + ENN ONLY on training set
-        print("\n[STEP 2] Applying SMOTE + ENN on training set only...")
+        print("\nApplying SMOTE + ENN on training set...")
         smote = BorderlineSMOTE(
             random_state=42,
             k_neighbors=5,
@@ -1053,19 +999,17 @@ def main(mode: str = 'xgboost_smoteenn'):
         print(f"  - After SMOTE+ENN: {X_train_resampled.shape}")
         print(f"  - Fraud rate: {y_train_resampled.mean():.4f}")
         
-        # Check GPU availability
         gpu_available = False
         try:
             import subprocess
             result = subprocess.run(['nvidia-smi'], capture_output=True, text=True, timeout=5)
             if result.returncode == 0:
                 gpu_available = True
-                print("\n[INFO] 🚀 GPU detected for Optuna tuning!")
+                print("\nGPU detected for Optuna tuning")
         except:
-            print("\n[INFO] ⚠️  No GPU detected. Using CPU for Optuna tuning.")
+            print("\nNo GPU - using CPU for Optuna tuning")
         
-        # STEP 3: Optuna hyperparameter tuning
-        print("\n[STEP 3] Running Optuna hyperparameter tuning...")
+        print("\nRunning Optuna hyperparameter tuning...")
         best_params = tune_xgboost_with_optuna(
             X_train_resampled, y_train_resampled,
             X_val_processed, y_val,
@@ -1073,7 +1017,6 @@ def main(mode: str = 'xgboost_smoteenn'):
             use_gpu=gpu_available
         )
         
-        # If Optuna failed, use default params
         if best_params is None:
             best_params = {
                 'n_estimators': 250,
@@ -1086,8 +1029,6 @@ def main(mode: str = 'xgboost_smoteenn'):
                 'min_child_weight': 6.0,
                 'gamma': 0.0
             }
-        
-        # Add base params
         best_params['objective'] = 'binary:logistic'
         best_params['eval_metric'] = 'aucpr'
         best_params['random_state'] = 42
@@ -1101,7 +1042,6 @@ def main(mode: str = 'xgboost_smoteenn'):
             best_params['device'] = 'cpu'
             best_params['n_jobs'] = -1
         
-        # Calculate scale_pos_weight
         pos = int(y_train_resampled.sum())
         neg = len(y_train_resampled) - pos
         scale_pos_weight = neg / pos
@@ -1117,23 +1057,40 @@ def main(mode: str = 'xgboost_smoteenn'):
         training_time = time.time() - start_time
         print(f"\n[INFO] Training completed in {training_time:.2f} seconds")
         
-        # STEP 5: Find optimal threshold on validation set
-        print("\n[STEP 5] Finding optimal threshold on validation set...")
+        print("\nFinding optimal thresholds on validation set...")
         y_val_proba = final_classifier.predict_proba(X_val_processed)[:, 1]
         
         optimal_threshold, best_f1, threshold_metrics = find_optimal_threshold(
             y_val, y_val_proba, metric='f1'
         )
+        precision_threshold, _, precision_metrics = find_optimal_threshold(
+            y_val, y_val_proba, metric='precision'
+        )
+        recall_threshold, _, recall_metrics = find_optimal_threshold(
+            y_val, y_val_proba, metric='recall'
+        )
         
-        print(f"\n[INFO] ✅ Optimal threshold found!")
-        print(f"  - Threshold: {optimal_threshold:.4f} (default: 0.5)")
+        print(f"\nOptimal thresholds found on validation set:")
+        print(f"\n1. F1-Maximizing Threshold:")
+        print(f"  - Threshold: {optimal_threshold:.4f}")
         print(f"  - Val Precision: {threshold_metrics['precision']:.4f}")
         print(f"  - Val Recall: {threshold_metrics['recall']:.4f}")
         print(f"  - Val F1-Score: {threshold_metrics['f1']:.4f}")
         
-        # Evaluate with optimal threshold
+        print(f"\n2. Precision-Maximizing Threshold (Conservative):")
+        print(f"  - Threshold: {precision_threshold:.4f}")
+        print(f"  - Val Precision: {precision_metrics['precision']:.4f}")
+        print(f"  - Val Recall: {precision_metrics['recall']:.4f}")
+        print(f"  - Val F1-Score: {precision_metrics['f1']:.4f}")
+        
+        print(f"\n3. Recall-Maximizing Threshold (Aggressive):")
+        print(f"  - Threshold: {recall_threshold:.4f}")
+        print(f"  - Val Precision: {recall_metrics['precision']:.4f}")
+        print(f"  - Val Recall: {recall_metrics['recall']:.4f}")
+        print(f"  - Val F1-Score: {recall_metrics['f1']:.4f}")
+        
         print("\n" + "="*60)
-        print(" EVALUATION RESULTS (OPTIMIZED THRESHOLD) ")
+        print(" EVALUATION RESULTS ")
         print("="*60)
         
         train_results = evaluate_model_with_threshold(
@@ -1166,7 +1123,33 @@ def main(mode: str = 'xgboost_smoteenn'):
             })(),
             X_test, y_test,
             threshold=optimal_threshold,
-            dataset_name="TEST"
+            dataset_name="TEST (F1-Optimal)"
+        )
+        
+        print("\n" + "="*60)
+        print(" MULTI-THRESHOLD COMPARISON ")
+        print("="*60)
+        
+        test_precision_max = evaluate_model_with_threshold(
+            type('Pipeline', (), {
+                'predict_proba': lambda self, X: final_classifier.predict_proba(
+                    preprocessing_pipeline.transform(X)
+                )
+            })(),
+            X_test, y_test,
+            threshold=precision_threshold,
+            dataset_name="TEST (Precision-Max)"
+        )
+        
+        test_recall_max = evaluate_model_with_threshold(
+            type('Pipeline', (), {
+                'predict_proba': lambda self, X: final_classifier.predict_proba(
+                    preprocessing_pipeline.transform(X)
+                )
+            })(),
+            X_test, y_test,
+            threshold=recall_threshold,
+            dataset_name="TEST (Recall-Max)"
         )
         
         # Add y_true for plotting
@@ -1181,8 +1164,12 @@ def main(mode: str = 'xgboost_smoteenn'):
             'Test': test_results
         }, out_dir)
         
-        # Plot feature importance (all 21 features)
-        print("\n[INFO] Generating feature importance plot (ALL features)...")
+        # Display ROC-PR curves
+        curves_path = os.path.join(out_dir, 'roc_pr_curves_no_leakage.png')
+        print(f"\nDisplaying ROC-PR curves...")
+        display_image(curves_path)
+        
+        print("\nGenerating feature importance plot...")
         
         dummy_pipeline = type('Pipeline', (), {
             'named_steps': {'classifier': final_classifier}
@@ -1195,6 +1182,11 @@ def main(mode: str = 'xgboost_smoteenn'):
             top_n=min(20, len(all_features))
         )
         
+        # Display feature importance
+        importance_path = os.path.join(out_dir, 'feature_importance.png')
+        print(f"\nDisplaying feature importance plot...")
+        display_image(importance_path)
+        
         # Save complete pipeline
         complete_pipeline = FraudDetectionPipeline(
             preprocessing_pipeline,
@@ -1203,12 +1195,16 @@ def main(mode: str = 'xgboost_smoteenn'):
         )
         
         model_path = os.path.join(out_dir, 'fraud_detection_smoteenn.pkl')
-        joblib.dump(complete_pipeline, model_path)
-        print(f"\n[INFO] Model saved to {model_path}")
-        print(f"[INFO] Pipeline includes:")
-        print(f"  - Preprocessor: {list(preprocessing_pipeline.named_steps.keys())}")
-        print(f"  - Classifier: XGBoost")
-        print(f"  - Optimal threshold: {optimal_threshold:.4f}")
+        try:
+            joblib.dump(complete_pipeline, model_path)
+            print(f"\nModel saved to {model_path}")
+            print(f"Pipeline includes:")
+            print(f"  - Preprocessor: {list(preprocessing_pipeline.named_steps.keys())}")
+            print(f"  - Classifier: XGBoost")
+            print(f"  - Optimal threshold: {optimal_threshold:.4f}")
+        except Exception as e:
+            print(f"\nWarning: Failed to save model: {e}")
+            print("Continuing without saving model file...")
         
         # Overfitting check
         print("\n" + "="*60)
@@ -1239,16 +1235,27 @@ def main(mode: str = 'xgboost_smoteenn'):
             'mode': mode,
             'train': {k: v for k, v in train_results.items() if k not in ['y_proba', 'y_true']},
             'val': {k: v for k, v in val_results.items() if k not in ['y_proba', 'y_true']},
-            'test': {k: v for k, v in test_results.items() if k not in ['y_proba', 'y_true']},
+            'test_f1_optimal': {k: v for k, v in test_results.items() if k not in ['y_proba', 'y_true']},
+            'test_precision_max': {k: v for k, v in test_precision_max.items() if k not in ['y_proba', 'y_true']},
+            'test_recall_max': {k: v for k, v in test_recall_max.items() if k not in ['y_proba', 'y_true']},
             'training_time_sec': float(training_time),
             'val_test_gap': {
                 'roc_auc': float(val_test_gap_roc),
                 'pr_auc': float(val_test_gap_pr)
             },
-            'threshold_tuning': {
-                'optimal_threshold': float(optimal_threshold),
-                'default_threshold': 0.5,
-                'threshold_metrics': threshold_metrics
+            'threshold_strategies': {
+                'f1_optimal': {
+                    'threshold': float(optimal_threshold),
+                    'val_metrics': threshold_metrics
+                },
+                'precision_max': {
+                    'threshold': float(precision_threshold),
+                    'val_metrics': precision_metrics
+                },
+                'recall_max': {
+                    'threshold': float(recall_threshold),
+                    'val_metrics': recall_metrics
+                }
             },
             'feature_selection': {
                 'total_features': int(total_features),
@@ -1264,6 +1271,29 @@ def main(mode: str = 'xgboost_smoteenn'):
         
         print(f"\n[INFO] Results saved to {out_dir}/results_no_leakage.json")
         
+        # Print threshold strategies summary
+        print("\n" + "="*60)
+        print(" THRESHOLD STRATEGIES SUMMARY ")
+        print("="*60)
+        print("\n1. F1-Optimal Strategy (Balanced):")
+        print(f"   Threshold: {optimal_threshold:.4f}")
+        print(f"   Val Precision: {threshold_metrics['precision']:.4f}")
+        print(f"   Val Recall: {threshold_metrics['recall']:.4f}")
+        print(f"   Val F1-Score: {threshold_metrics['f1']:.4f}")
+        
+        print("\n2. Precision-Max Strategy (Conservative):")
+        print(f"   Threshold: {precision_threshold:.4f}")
+        print(f"   Val Precision: {precision_metrics['precision']:.4f}")
+        print(f"   Val Recall: {precision_metrics['recall']:.4f}")
+        print(f"   Val F1-Score: {precision_metrics['f1']:.4f}")
+        
+        print("\n3. Recall-Max Strategy (Aggressive):")
+        print(f"   Threshold: {recall_threshold:.4f}")
+        print(f"   Val Precision: {recall_metrics['precision']:.4f}")
+        print(f"   Val Recall: {recall_metrics['recall']:.4f}")
+        print(f"   Val F1-Score: {recall_metrics['f1']:.4f}")
+        print("="*60 + "\n")
+        
         pipeline = complete_pipeline  # Return complete pipeline
     
     # ========================================
@@ -1272,7 +1302,7 @@ def main(mode: str = 'xgboost_smoteenn'):
     
     elif mode == 'xgboost_fa_smoteenn':
         print("\n" + "="*80)
-        print(" XGBOOST + FA + SMOTEENN (CÓ Feature Selection - No Leakage) ")
+        print(" XGBOOST + FIREFLY ALGORITHM + SMOTEENN ")
         print("="*80)
         
         print("\nFA Configuration:")
@@ -1283,8 +1313,7 @@ def main(mode: str = 'xgboost_smoteenn'):
         
         start_time = time.time()
         
-        # Create pipeline WITH feature selection BUT WITHOUT resampling/classifier
-        # We'll add resampling and classifier separately
+        print("\nCreating preprocessing pipeline...")
         pipeline_steps = [
             ('date_features', DateFeatureExtractor()),
             ('missing_handler', MissingValueHandler()),
@@ -1292,23 +1321,25 @@ def main(mode: str = 'xgboost_smoteenn'):
             ('scaler', StandardScaler()),
         ]
         
-        if fa_config is None:
-            fa_config = FAConfig()
-        
-        pipeline_steps.append(('feature_selector', FeatureSelector(config=fa_config)))
-        
-        # Create preprocessing pipeline (NO resampling yet)
         from sklearn.pipeline import Pipeline as SkPipeline
         preprocessing_pipeline = SkPipeline(pipeline_steps)
         
-        # Fit preprocessing + FA feature selection
-        print("\n[STEP 1] Running preprocessing + FA feature selection...")
-        X_train_processed = preprocessing_pipeline.fit_transform(X_train, y_train)
+        print("Running preprocessing on all sets...")
+        X_train_processed = preprocessing_pipeline.fit_transform(X_train)
         X_val_processed = preprocessing_pipeline.transform(X_val)
         X_test_processed = preprocessing_pipeline.transform(X_test)
         
-        # Apply SMOTE + ENN ONLY on training set
-        print("\n[STEP 1.5] Applying SMOTE + ENN on training set only...")
+        # Get feature names after preprocessing
+        if isinstance(X_train_processed, pd.DataFrame):
+            all_features = X_train_processed.columns.tolist()
+        else:
+            all_features = [f"feature_{i}" for i in range(X_train_processed.shape[1])]
+        
+        total_features = len(all_features)
+        print(f"\nTotal features: {total_features}")
+        
+        print("\nApplying SMOTE + ENN (before feature selection)...")
+        print("FA will evaluate features on balanced data")
         smote = BorderlineSMOTE(
             random_state=42,
             k_neighbors=5,
@@ -1326,12 +1357,37 @@ def main(mode: str = 'xgboost_smoteenn'):
         print(f"  - After SMOTE+ENN: {X_train_resampled.shape}")
         print(f"  - Fraud rate: {y_train_resampled.mean():.4f}")
         
-        # Get selected features
-        selected_features = preprocessing_pipeline.named_steps['feature_selector'].selected_features_
-        total_features = len(preprocessing_pipeline.named_steps['feature_selector'].feature_names_)
+        print("\nRunning FA Feature Selection on balanced training data...")
         
-        print(f"\n[INFO] Selected {len(selected_features)}/{total_features} features")
-        print(f"[INFO] Selected features: {selected_features[:10]}... (showing first 10)")
+        if fa_config is None:
+            fa_config = FAConfig()
+        
+        feature_selector = FeatureSelector(config=fa_config)
+        
+        # Convert to DataFrame if needed for FA
+        if not isinstance(X_train_resampled, pd.DataFrame):
+            X_train_resampled = pd.DataFrame(X_train_resampled, columns=all_features)
+        
+        # Fit FA on BALANCED training data
+        X_train_selected = feature_selector.fit_transform(X_train_resampled, y_train_resampled)
+        
+        selected_features = feature_selector.selected_features_
+        
+        print(f"\nSelected {len(selected_features)}/{total_features} features")
+        print(f"Selected features: {selected_features[:10]}... (showing first 10)")
+        
+        print("\nApplying feature selection to Val and Test sets...")
+        if not isinstance(X_val_processed, pd.DataFrame):
+            X_val_processed = pd.DataFrame(X_val_processed, columns=all_features)
+        if not isinstance(X_test_processed, pd.DataFrame):
+            X_test_processed = pd.DataFrame(X_test_processed, columns=all_features)
+        
+        X_val_selected = X_val_processed[selected_features]
+        X_test_selected = X_test_processed[selected_features]
+        
+        print(f"  - Train (selected): {X_train_selected.shape}")
+        print(f"  - Val (selected): {X_val_selected.shape}")
+        print(f"  - Test (selected): {X_test_selected.shape}")
         
         # Check GPU availability
         gpu_available = False
@@ -1344,11 +1400,11 @@ def main(mode: str = 'xgboost_smoteenn'):
         except:
             print("\n[INFO] ⚠️  No GPU detected. Using CPU for Optuna tuning.")
         
-        # STEP 2: Optuna hyperparameter tuning
-        print("\n[STEP 2] Running Optuna hyperparameter tuning...")
+        # STEP 4: Optuna hyperparameter tuning (on BALANCED + SELECTED features)
+        print("\n[STEP 4] Running Optuna hyperparameter tuning...")
         best_params = tune_xgboost_with_optuna(
-            X_train_resampled, y_train_resampled,  # Use resampled data
-            X_val_processed, y_val,
+            X_train_selected, y_train_resampled,  # Use BALANCED + SELECTED data
+            X_val_selected, y_val,
             n_trials=50,
             use_gpu=gpu_available
         )
@@ -1400,39 +1456,58 @@ def main(mode: str = 'xgboost_smoteenn'):
         scale_pos_weight = neg / pos
         best_params['scale_pos_weight'] = scale_pos_weight
         
-        # STEP 3: Train final model with best params
-        print(f"\n[STEP 3] Training final XGBoost with optimized params...")
+        print(f"\nTraining final XGBoost with optimized params...")
         print(f"  - scale_pos_weight: {scale_pos_weight:.2f}")
+        print(f"  - Training on balanced data with selected features")
         
         final_classifier = XGBClassifier(**best_params)
-        final_classifier.fit(X_train_resampled, y_train_resampled)  # Use resampled data
+        final_classifier.fit(X_train_selected, y_train_resampled)
         
         training_time = time.time() - start_time
-        print(f"\n[INFO] Training completed in {training_time:.2f} seconds")
+        print(f"\nTraining completed in {training_time:.2f} seconds")
         
-        # STEP 4: Find optimal threshold on validation set
-        print("\n[STEP 4] Finding optimal threshold on validation set...")
-        y_val_proba = final_classifier.predict_proba(X_val_processed)[:, 1]
+        print("\nFinding optimal thresholds on validation set...")
+        y_val_proba = final_classifier.predict_proba(X_val_selected)[:, 1]
         
         optimal_threshold, best_f1, threshold_metrics = find_optimal_threshold(
             y_val, y_val_proba, metric='f1'
         )
+        precision_threshold, _, precision_metrics = find_optimal_threshold(
+            y_val, y_val_proba, metric='precision'
+        )
+        recall_threshold, _, recall_metrics = find_optimal_threshold(
+            y_val, y_val_proba, metric='recall'
+        )
         
-        print(f"\n[INFO] ✅ Optimal threshold found!")
-        print(f"  - Threshold: {optimal_threshold:.4f} (default: 0.5)")
+        print(f"\nOptimal thresholds found on validation set:")
+        print(f"\n1. F1-Maximizing Threshold:")
+        print(f"  - Threshold: {optimal_threshold:.4f}")
         print(f"  - Val Precision: {threshold_metrics['precision']:.4f}")
         print(f"  - Val Recall: {threshold_metrics['recall']:.4f}")
         print(f"  - Val F1-Score: {threshold_metrics['f1']:.4f}")
         
-        # Evaluate with optimal threshold
+        print(f"\n2. Precision-Maximizing Threshold (Conservative):")
+        print(f"  - Threshold: {precision_threshold:.4f}")
+        print(f"  - Val Precision: {precision_metrics['precision']:.4f}")
+        print(f"  - Val Recall: {precision_metrics['recall']:.4f}")
+        print(f"  - Val F1-Score: {precision_metrics['f1']:.4f}")
+        
+        print(f"\n3. Recall-Maximizing Threshold (Aggressive):")
+        print(f"  - Threshold: {recall_threshold:.4f}")
+        print(f"  - Val Precision: {recall_metrics['precision']:.4f}")
+        print(f"  - Val Recall: {recall_metrics['recall']:.4f}")
+        print(f"  - Val F1-Score: {recall_metrics['f1']:.4f}")
+        
+        full_preprocessing = FullPreprocessingPipeline(preprocessing_pipeline, feature_selector)
+        
         print("\n" + "="*60)
-        print(" EVALUATION RESULTS (OPTIMIZED THRESHOLD) ")
+        print(" EVALUATION RESULTS ")
         print("="*60)
         
         train_results = evaluate_model_with_threshold(
             type('Pipeline', (), {
                 'predict_proba': lambda self, X: final_classifier.predict_proba(
-                    preprocessing_pipeline.transform(X)
+                    full_preprocessing.transform(X)
                 )
             })(),
             X_train, y_train, 
@@ -1443,7 +1518,7 @@ def main(mode: str = 'xgboost_smoteenn'):
         val_results = evaluate_model_with_threshold(
             type('Pipeline', (), {
                 'predict_proba': lambda self, X: final_classifier.predict_proba(
-                    preprocessing_pipeline.transform(X)
+                    full_preprocessing.transform(X)
                 )
             })(),
             X_val, y_val,
@@ -1454,12 +1529,38 @@ def main(mode: str = 'xgboost_smoteenn'):
         test_results = evaluate_model_with_threshold(
             type('Pipeline', (), {
                 'predict_proba': lambda self, X: final_classifier.predict_proba(
-                    preprocessing_pipeline.transform(X)
+                    full_preprocessing.transform(X)
                 )
             })(),
             X_test, y_test,
             threshold=optimal_threshold,
-            dataset_name="TEST"
+            dataset_name="TEST (F1-Optimal)"
+        )
+        
+        print("\n" + "="*60)
+        print(" MULTI-THRESHOLD COMPARISON ")
+        print("="*60)
+        
+        test_precision_max = evaluate_model_with_threshold(
+            type('Pipeline', (), {
+                'predict_proba': lambda self, X: final_classifier.predict_proba(
+                    full_preprocessing.transform(X)
+                )
+            })(),
+            X_test, y_test,
+            threshold=precision_threshold,
+            dataset_name="TEST (Precision-Max)"
+        )
+        
+        test_recall_max = evaluate_model_with_threshold(
+            type('Pipeline', (), {
+                'predict_proba': lambda self, X: final_classifier.predict_proba(
+                    full_preprocessing.transform(X)
+                )
+            })(),
+            X_test, y_test,
+            threshold=recall_threshold,
+            dataset_name="TEST (Recall-Max)"
         )
         
         # Add y_true for plotting
@@ -1474,8 +1575,12 @@ def main(mode: str = 'xgboost_smoteenn'):
             'Test': test_results
         }, out_dir)
         
-        # Plot feature importance (after FA selection)
-        print("\n[INFO] Generating feature importance plot (FA-selected features)...")
+        # Display ROC-PR curves
+        curves_path = os.path.join(out_dir, 'roc_pr_curves_no_leakage.png')
+        print(f"\nDisplaying ROC-PR curves...")
+        display_image(curves_path)
+        
+        print("\nGenerating feature importance plot...")
         
         # Create a dummy pipeline for feature importance plotting
         dummy_pipeline = type('Pipeline', (), {
@@ -1489,21 +1594,31 @@ def main(mode: str = 'xgboost_smoteenn'):
             top_n=min(20, len(selected_features))
         )
         
-        # Save complete pipeline (preprocessing only, classifier separate)
-        # Create a wrapper for prediction that combines preprocessing + classifier
+        # Display feature importance
+        importance_path = os.path.join(out_dir, 'feature_importance.png')
+        print(f"\nDisplaying feature importance plot...")
+        display_image(importance_path)
+        
+        # Save complete pipeline (preprocessing + feature selection + classifier)
+        # Create a wrapper for prediction that combines all components
         complete_pipeline = FraudDetectionPipeline(
-            preprocessing_pipeline, 
+            full_preprocessing,  # Use the combined preprocessing + feature selection
             final_classifier,
             threshold=optimal_threshold
         )
         
         model_path = os.path.join(out_dir, 'fraud_detection_fa_smoteenn.pkl')
-        joblib.dump(complete_pipeline, model_path)
-        print(f"\n[INFO] Model saved to {model_path}")
-        print(f"[INFO] Pipeline includes:")
-        print(f"  - Preprocessor: {list(preprocessing_pipeline.named_steps.keys())}")
-        print(f"  - Classifier: XGBoost")
-        print(f"  - Optimal threshold: {optimal_threshold:.4f}")
+        try:
+            joblib.dump(complete_pipeline, model_path)
+            print(f"\nModel saved to {model_path}")
+            print(f"Pipeline includes:")
+            print(f"  - Preprocessor: {list(preprocessing_pipeline.named_steps.keys())}")
+            print(f"  - Feature Selector: FA ({len(selected_features)} features)")
+            print(f"  - Classifier: XGBoost")
+            print(f"  - Optimal threshold: {optimal_threshold:.4f}")
+        except Exception as e:
+            print(f"\nWarning: Failed to save model: {e}")
+            print("Continuing without saving model file...")
         
         # Overfitting check
         print("\n" + "="*60)
@@ -1534,16 +1649,27 @@ def main(mode: str = 'xgboost_smoteenn'):
             'mode': mode,
             'train': {k: v for k, v in train_results.items() if k not in ['y_proba', 'y_true']},
             'val': {k: v for k, v in val_results.items() if k not in ['y_proba', 'y_true']},
-            'test': {k: v for k, v in test_results.items() if k not in ['y_proba', 'y_true']},
-            'training_time_sec': float(training_time),  # Convert to float
+            'test_f1_optimal': {k: v for k, v in test_results.items() if k not in ['y_proba', 'y_true']},
+            'test_precision_max': {k: v for k, v in test_precision_max.items() if k not in ['y_proba', 'y_true']},
+            'test_recall_max': {k: v for k, v in test_recall_max.items() if k not in ['y_proba', 'y_true']},
+            'training_time_sec': float(training_time),
             'val_test_gap': {
                 'roc_auc': float(val_test_gap_roc),
                 'pr_auc': float(val_test_gap_pr)
             },
-            'threshold_tuning': {
-                'optimal_threshold': float(optimal_threshold),  # Ensure float
-                'default_threshold': 0.5,
-                'threshold_metrics': threshold_metrics  # Already converted in find_optimal_threshold
+            'threshold_strategies': {
+                'f1_optimal': {
+                    'threshold': float(optimal_threshold),
+                    'val_metrics': threshold_metrics
+                },
+                'precision_max': {
+                    'threshold': float(precision_threshold),
+                    'val_metrics': precision_metrics
+                },
+                'recall_max': {
+                    'threshold': float(recall_threshold),
+                    'val_metrics': recall_metrics
+                }
             },
             'feature_selection': {
                 'fa_config': {
@@ -1558,118 +1684,51 @@ def main(mode: str = 'xgboost_smoteenn'):
                 'selected_count': int(len(selected_features)),
                 'selected_features': selected_features
             },
-            'xgboost_params': best_params_json  # Use converted params
+            'xgboost_params': best_params_json
         }
         
         with open(os.path.join(out_dir, 'results_no_leakage.json'), 'w') as f:
             json.dump(results_json, f, indent=2)
         
-        print(f"\n[INFO] Results saved to {out_dir}/results_no_leakage.json")
+        print(f"\nResults saved to {out_dir}/results_no_leakage.json")
+        
+        # Print threshold strategies summary
+        print("\n" + "="*60)
+        print(" THRESHOLD STRATEGIES SUMMARY ")
+        print("="*60)
+        print("\n1. F1-Optimal Strategy (Balanced):")
+        print(f"   Threshold: {optimal_threshold:.4f}")
+        print(f"   Val Precision: {threshold_metrics['precision']:.4f}")
+        print(f"   Val Recall: {threshold_metrics['recall']:.4f}")
+        print(f"   Val F1-Score: {threshold_metrics['f1']:.4f}")
+        
+        print("\n2. Precision-Max Strategy (Conservative):")
+        print(f"   Threshold: {precision_threshold:.4f}")
+        print(f"   Val Precision: {precision_metrics['precision']:.4f}")
+        print(f"   Val Recall: {precision_metrics['recall']:.4f}")
+        print(f"   Val F1-Score: {precision_metrics['f1']:.4f}")
+        
+        print("\n3. Recall-Max Strategy (Aggressive):")
+        print(f"   Threshold: {recall_threshold:.4f}")
+        print(f"   Val Precision: {recall_metrics['precision']:.4f}")
+        print(f"   Val Recall: {recall_metrics['recall']:.4f}")
+        print(f"   Val F1-Score: {recall_metrics['f1']:.4f}")
+        print("="*60 + "\n")
+        
+        pipeline = complete_pipeline
     
     else:
-        print(f"\n❌ ERROR: Invalid mode '{mode}'")
+        print(f"\nERROR: Invalid mode '{mode}'")
         print("Valid modes: 'xgboost_smoteenn' or 'xgboost_fa_smoteenn'")
         return None
     
     print("\n" + "="*80)
-    print(" HOÀN THÀNH! ")
+    print(" COMPLETED ")
     print("="*80)
     
     return pipeline
 
-
-# ============================================================================
-# RUN
-# ============================================================================
-
 if __name__ == "__main__":
-    """
-    Chạy training với pipeline KHÔNG có data leakage
-    
-    Key improvements V3 (FINAL):
-    1. Load RAW data (không preprocessing trước)
-    2. Split FIRST (train/val/test = 60/20/20)
-    3. Preprocessing trong Pipeline riêng biệt
-    4. SMOTE/ENN chỉ áp dụng trên train set (sampling_strategy=0.1)
-    5. Val và Test KHÔNG được resample
-    6. Optuna hyperparameter tuning (50 trials) - BOTH MODES
-    7. Threshold tuning (maximize F1 on validation set) - BOTH MODES
-    8. FraudDetectionPipeline wrapper - BOTH MODES
-    9. Chạy trên fraudTrain.csv để so sánh fair
-    
-    ════════════════════════════════════════════════════════════════════════
-    📊 MODE COMPARISON - BOTH USE IDENTICAL WORKFLOW (except feature selection)
-    ════════════════════════════════════════════════════════════════════════
-    
-    MODE 1: 'xgboost_smoteenn' (NO Feature Selection - ALL 21 features)
-    ────────────────────────────────────────────────────────────────────
-    Workflow:
-      1. Load RAW data
-      2. Split (60/20/20)
-      3. PREPROCESSING (DateFeatureExtractor → MissingValueHandler → 
-                        CategoricalEncoder → StandardScaler)
-         → Result: 21 features
-      4. NO Feature Selection → Use ALL 21 features
-      5. RESAMPLING (TRAIN SET ONLY!)
-         - BorderlineSMOTE (sampling_strategy=0.1)
-         - EditedNearestNeighbours
-      6. OPTUNA HYPERPARAMETER TUNING (50 trials)
-      7. TRAIN FINAL XGBOOST MODEL (with optimized params)
-      8. THRESHOLD OPTIMIZATION (on Validation set)
-      9. Complete Pipeline → Save Model → Evaluation
-    
-    Expected:
-      - Uses ALL 21 features (no feature reduction)
-      - Baseline comparison for FA mode
-      - May have lower performance due to irrelevant features
-    
-    
-    MODE 2: 'xgboost_fa_smoteenn' (WITH FA Feature Selection - ~15 features)
-    ────────────────────────────────────────────────────────────────────
-    Workflow:
-      1. Load RAW data
-      2. Split (60/20/20)
-      3. PREPROCESSING (DateFeatureExtractor → MissingValueHandler → 
-                        CategoricalEncoder → StandardScaler)
-         → Result: 21 features
-      4. FA FEATURE SELECTION (Firefly Algorithm)
-         - n_fireflies=40, n_epochs=10
-         - Select ~15 most important features
-         → Result: 15 selected features
-      5. RESAMPLING (TRAIN SET ONLY!)
-         - BorderlineSMOTE (sampling_strategy=0.1)
-         - EditedNearestNeighbours
-      6. OPTUNA HYPERPARAMETER TUNING (50 trials)
-      7. TRAIN FINAL XGBOOST MODEL (with optimized params)
-      8. THRESHOLD OPTIMIZATION (on Validation set)
-      9. Complete Pipeline → Save Model → Evaluation
-    
-    Expected:
-      - Uses only 15 most important features
-      - Better generalization (less overfitting)
-      - Higher Precision & F1-Score
-      - Faster inference (fewer features)
-    
-    ════════════════════════════════════════════════════════════════════════
-    📈 COMPARISON METRICS
-    ════════════════════════════════════════════════════════════════════════
-    Compare these metrics between the two modes:
-      - ROC-AUC, PR-AUC
-      - Precision, Recall, F1-Score
-      - Val-Test gap (overfitting check)
-      - Training time
-      - Number of features used
-      - Optimal threshold
-    
-    ════════════════════════════════════════════════════════════════════════
-    """
-    
-    # ========== VÍ DỤ SỬ DỤNG ==========
-    
-    # Ví dụ 1: Chạy XGBoost + SMOTEENN (NO Feature Selection - ALL 21 features)
     # pipeline = main(mode='xgboost_smoteenn')
-    
-    # Ví dụ 2: Chạy XGBoost + FA + SMOTEENN (WITH FA - 15 features) - RECOMMENDED
     pipeline = main(mode='xgboost_fa_smoteenn')
-    
-    # Để so sánh 2 modes, chạy cả 2 và so sánh file results_no_leakage.json
+
