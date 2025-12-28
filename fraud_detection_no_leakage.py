@@ -1,30 +1,33 @@
 # Fraud Detection - No Data Leakage Version
 
+import os
+
+# Limit BLAS/OpenMP threads early (must be set before numpy/scikit-learn imports)
+# Helps avoid OpenBLAS OpenMP-loop warnings/hangs in some Linux runtimes.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import pandas as pd
 import numpy as np
 import json
-import os
 import time
 import warnings
 import subprocess
 import math
-from typing import Tuple, Dict
+from typing import Tuple
 from dataclasses import dataclass
 from sklearn.base import BaseEstimator, TransformerMixin
 from PIL import Image
 
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
-from sklearn.compose import ColumnTransformer
 from sklearn.metrics import (
     roc_auc_score, average_precision_score, precision_recall_curve,
     roc_curve, f1_score, precision_score, recall_score
 )
 from xgboost import XGBClassifier
-from imblearn.over_sampling import BorderlineSMOTE
-from imblearn.under_sampling import EditedNearestNeighbours
-from imblearn.pipeline import Pipeline as ImbPipeline
 import matplotlib.pyplot as plt
 import joblib
 
@@ -52,7 +55,7 @@ class FAConfig:
     gamma: float = 0.20
     levy_beta: float = 1.5
     levy_scale: float = 0.1
-    lambda_feat: float = 0.01
+    lambda_feat: float = 0.005
     diversity_threshold: float = 0.1
     patience: int = 6
     validation_strictness: float = 0.8
@@ -480,167 +483,34 @@ class FeatureSelector(BaseEstimator, TransformerMixin):
             # Convert to DataFrame for selection
             df = pd.DataFrame(X, columns=self.feature_names_)
             return df[self.selected_features_].values
-
-
-def create_training_pipeline(random_state=42, use_feature_selection=False, fa_config=None):
-    """Create training pipeline without data leakage"""
-    
-    # Check GPU availability
-    gpu_available = False
-    try:
-        import subprocess
-        result = subprocess.run(['nvidia-smi'], capture_output=True, text=True, timeout=5)
-        if result.returncode == 0:
-            gpu_available = True
-            print("GPU detected - using GPU acceleration")
-        else:
-            print("No GPU detected - using CPU")
-    except:
-        print("GPU check failed - using CPU")
-    
-    steps = [
-        ('date_features', DateFeatureExtractor()),
-        ('missing_handler', MissingValueHandler()),
-        # SMOTE cần dữ liệu số ⇒ mã hóa trước khi resample
-        ('categorical_encoder', CategoricalEncoder()),
-        ('scaler', StandardScaler()),
-        # Xử lý mất cân bằng ngay sau khi có đặc trưng số
-        ('smote', BorderlineSMOTE(
-            random_state=random_state,
-            k_neighbors=5,
-            sampling_strategy=0.1
-        )),
-        ('enn', EditedNearestNeighbours(
-            n_neighbors=3,
-            sampling_strategy='auto'
-        )),
-    ]
-
-    if use_feature_selection:
-        if fa_config is None:
-            fa_config = FAConfig()
-        # Feature selection sau SMOTE/ENN để chọn trên phân phối đã cân bằng
-        steps.append(('feature_selector', FeatureSelector(config=fa_config)))
-
-    # Configure XGBoost for GPU or CPU
-    if gpu_available:
-        xgb_params = {
-            'objective': 'binary:logistic',
-            'tree_method': 'gpu_hist',
-            'device': 'cuda',
-            'n_estimators': 250,
-            'learning_rate': 0.04,
-            'max_depth': 5,
-            'subsample': 0.8,
-            'colsample_bytree': 0.8,
-            'reg_alpha': 3.0,
-            'reg_lambda': 6.0,
-            'min_child_weight': 6.0,
-            'eval_metric': 'aucpr',
-            'random_state': random_state
-        }
-    else:
-        xgb_params = {
-            'objective': 'binary:logistic',
-            'tree_method': 'hist',
-            'device': 'cpu',
-            'n_estimators': 250,
-            'learning_rate': 0.04,
-            'max_depth': 5,
-            'subsample': 0.8,
-            'colsample_bytree': 0.8,
-            'reg_alpha': 3.0,
-            'reg_lambda': 6.0,
-            'min_child_weight': 6.0,
-            'eval_metric': 'aucpr',
-            'random_state': random_state,
-            'n_jobs': -1
-        }
-    
-    steps.extend([
-        ('smote', BorderlineSMOTE(
-            random_state=random_state,
-            k_neighbors=5,
-            sampling_strategy=0.1
-        )),
-        ('enn', EditedNearestNeighbours(
-            n_neighbors=3,
-            sampling_strategy='auto'
-        )),
-        ('classifier', XGBClassifier(**xgb_params))
-    ])
-    
-    pipeline = ImbPipeline(steps)
-    
-    return pipeline
-
-
 # Training & Evaluation
 
-def evaluate_model(pipeline, X, y, dataset_name="Dataset"):
-    """Evaluate model performance"""
-    
-    y_proba = pipeline.predict_proba(X)[:, 1]
-    y_pred = pipeline.predict(X)
-    
-    roc_auc = roc_auc_score(y, y_proba)
-    pr_auc = average_precision_score(y, y_proba)
-    precision = precision_score(y, y_pred, zero_division=0)
-    recall = recall_score(y, y_pred, zero_division=0)
-    f1 = f1_score(y, y_pred)
-    
-    print(f"\n{dataset_name} Metrics:")
-    print(f"  ROC-AUC:    {roc_auc:.4f}")
-    print(f"  PR-AUC:     {pr_auc:.4f}")
-    print(f"  Precision:  {precision:.4f}")
-    print(f"  Recall:     {recall:.4f}")
-    print(f"  F1-Score:   {f1:.4f}")
-    
-    return {
-        'roc_auc': float(roc_auc),
-        'pr_auc': float(pr_auc),
-        'precision': float(precision),
-        'recall': float(recall),
-        'f1': float(f1),
-        'y_proba': y_proba
-    }
-
-
-def find_optimal_threshold(y_true, y_proba, metric='f1'):
+def find_optimal_threshold(y_true, y_proba):
+    """Find a single optimal threshold (F1-maximizing) on a validation set."""
 
     precisions, recalls, thresholds = precision_recall_curve(y_true, y_proba)
-    
-    # Calculate F1 for each threshold
+
+    # Calculate F1 for each threshold (thresholds has length N, precisions/recalls has length N+1)
     f1_scores = []
     for i in range(len(thresholds)):
-        if precisions[i] + recalls[i] > 0:
-            f1 = 2 * (precisions[i] * recalls[i]) / (precisions[i] + recalls[i])
+        p = precisions[i]
+        r = recalls[i]
+        if p + r > 0:
+            f1 = 2 * (p * r) / (p + r)
         else:
             f1 = 0.0
         f1_scores.append(f1)
-    
+
     f1_scores = np.array(f1_scores)
-    
-    if metric == 'f1':
-        best_idx = np.argmax(f1_scores)
-        best_score = f1_scores[best_idx]
-    elif metric == 'precision':
-        best_idx = np.argmax(precisions[:-1])
-        best_score = precisions[best_idx]
-    elif metric == 'recall':
-        best_idx = np.argmax(recalls[:-1])
-        best_score = recalls[best_idx]
-    else:
-        raise ValueError(f"Unknown metric: {metric}")
-    
-    optimal_threshold = thresholds[best_idx]
-    
-    # Ensure all values are native Python types (not numpy)
-    return float(optimal_threshold), float(best_score), {
+    best_idx = int(np.argmax(f1_scores))
+    optimal_threshold = float(thresholds[best_idx])
+    best_f1 = float(f1_scores[best_idx])
+
+    return optimal_threshold, best_f1, {
         'precision': float(precisions[best_idx]),
         'recall': float(recalls[best_idx]),
-        'f1': float(f1_scores[best_idx]),
-        'threshold': float(optimal_threshold)
+        'f1': best_f1,
+        'threshold': optimal_threshold,
     }
 
 
@@ -787,7 +657,15 @@ def plot_feature_importance(pipeline, feature_names, out_dir='outputs', top_n=20
 
 # Hyperparameter Tuning
 
-def tune_xgboost_with_optuna(X_train, y_train, X_val, y_val, n_trials=50, use_gpu=False):
+def tune_xgboost_with_optuna(
+    X_train,
+    y_train,
+    X_val,
+    y_val,
+    n_trials=50,
+    use_gpu=False,
+    scale_pos_weight=None,
+):
 
     try:
         import optuna
@@ -819,6 +697,10 @@ def tune_xgboost_with_optuna(X_train, y_train, X_val, y_val, n_trials=50, use_gp
             'min_child_weight': trial.suggest_float('min_child_weight', 1.0, 10.0),
             'gamma': trial.suggest_float('gamma', 0.0, 5.0),
         }
+
+        # If provided, keep class-imbalance weighting fixed during tuning
+        if scale_pos_weight is not None:
+            params['scale_pos_weight'] = float(scale_pos_weight)
         
         if use_gpu:
             params['tree_method'] = 'gpu_hist'
@@ -947,10 +829,13 @@ def main(mode: str = 'xgboost_smoteenn'):
     print(f"Train: {X_train.shape}, fraud rate: {y_train.mean():.4f}")
     print(f"Val:   {X_val.shape}, fraud rate: {y_val.mean():.4f}")
     print(f"Test:  {X_test.shape}, fraud rate: {y_test.mean():.4f}")
+
+    # NOTE: SMOTE+ENN resampling removed.
+    # Modes below train on the original imbalanced data and use scale_pos_weight.
     
     if mode == 'xgboost_smoteenn':
         print("\n" + "="*80)
-        print(" XGBOOST + SMOTEENN (NO FEATURE SELECTION) ")
+        print(" XGBOOST (NO FEATURE SELECTION) ")
         print("="*80)
         
         start_time = time.time()
@@ -981,23 +866,11 @@ def main(mode: str = 'xgboost_smoteenn'):
         print(f"\nTotal features: {total_features}")
         print(f"Using ALL features (no feature selection)")
         
-        print("\nApplying SMOTE + ENN on training set...")
-        smote = BorderlineSMOTE(
-            random_state=42,
-            k_neighbors=5,
-            sampling_strategy=0.1
-        )
-        enn = EditedNearestNeighbours(
-            n_neighbors=3,
-            sampling_strategy='auto'
-        )
-        
-        X_train_resampled, y_train_resampled = smote.fit_resample(X_train_processed, y_train)
-        X_train_resampled, y_train_resampled = enn.fit_resample(X_train_resampled, y_train_resampled)
-        
-        print(f"  - Original train: {X_train_processed.shape}")
-        print(f"  - After SMOTE+ENN: {X_train_resampled.shape}")
-        print(f"  - Fraud rate: {y_train_resampled.mean():.4f}")
+        print("\n[INFO] Training on original imbalanced data (no SMOTE+ENN)")
+        X_train_final, y_train_final = X_train_processed, y_train
+
+        print(f"  - Train: {X_train_final.shape}")
+        print(f"  - Fraud rate: {y_train_final.mean():.4f}")
         
         gpu_available = False
         try:
@@ -1009,12 +882,18 @@ def main(mode: str = 'xgboost_smoteenn'):
         except:
             print("\nNo GPU - using CPU for Optuna tuning")
         
-        print("\nRunning Optuna hyperparameter tuning...")
+        # Calculate scale_pos_weight from ORIGINAL training labels
+        pos = int(y_train_final.sum())
+        neg = len(y_train_final) - pos
+        scale_pos_weight = (neg / pos) if pos > 0 else 1.0
+
+        print("\nRunning Optuna hyperparameter tuning (with fixed scale_pos_weight)...")
         best_params = tune_xgboost_with_optuna(
-            X_train_resampled, y_train_resampled,
+            X_train_final, y_train_final,
             X_val_processed, y_val,
             n_trials=50,
-            use_gpu=gpu_available
+            use_gpu=gpu_available,
+            scale_pos_weight=scale_pos_weight
         )
         
         if best_params is None:
@@ -1042,9 +921,6 @@ def main(mode: str = 'xgboost_smoteenn'):
             best_params['device'] = 'cpu'
             best_params['n_jobs'] = -1
         
-        pos = int(y_train_resampled.sum())
-        neg = len(y_train_resampled) - pos
-        scale_pos_weight = neg / pos
         best_params['scale_pos_weight'] = scale_pos_weight
         
         # STEP 4: Train final model with best params
@@ -1052,7 +928,7 @@ def main(mode: str = 'xgboost_smoteenn'):
         print(f"  - scale_pos_weight: {scale_pos_weight:.2f}")
         
         final_classifier = XGBClassifier(**best_params)
-        final_classifier.fit(X_train_resampled, y_train_resampled)
+        final_classifier.fit(X_train_final, y_train_final)
         
         training_time = time.time() - start_time
         print(f"\n[INFO] Training completed in {training_time:.2f} seconds")
@@ -1061,33 +937,14 @@ def main(mode: str = 'xgboost_smoteenn'):
         y_val_proba = final_classifier.predict_proba(X_val_processed)[:, 1]
         
         optimal_threshold, best_f1, threshold_metrics = find_optimal_threshold(
-            y_val, y_val_proba, metric='f1'
-        )
-        precision_threshold, _, precision_metrics = find_optimal_threshold(
-            y_val, y_val_proba, metric='precision'
-        )
-        recall_threshold, _, recall_metrics = find_optimal_threshold(
-            y_val, y_val_proba, metric='recall'
+            y_val, y_val_proba
         )
         
-        print(f"\nOptimal thresholds found on validation set:")
-        print(f"\n1. F1-Maximizing Threshold:")
+        print(f"\nOptimal threshold found on validation set (F1-max):")
         print(f"  - Threshold: {optimal_threshold:.4f}")
         print(f"  - Val Precision: {threshold_metrics['precision']:.4f}")
         print(f"  - Val Recall: {threshold_metrics['recall']:.4f}")
         print(f"  - Val F1-Score: {threshold_metrics['f1']:.4f}")
-        
-        print(f"\n2. Precision-Maximizing Threshold (Conservative):")
-        print(f"  - Threshold: {precision_threshold:.4f}")
-        print(f"  - Val Precision: {precision_metrics['precision']:.4f}")
-        print(f"  - Val Recall: {precision_metrics['recall']:.4f}")
-        print(f"  - Val F1-Score: {precision_metrics['f1']:.4f}")
-        
-        print(f"\n3. Recall-Maximizing Threshold (Aggressive):")
-        print(f"  - Threshold: {recall_threshold:.4f}")
-        print(f"  - Val Precision: {recall_metrics['precision']:.4f}")
-        print(f"  - Val Recall: {recall_metrics['recall']:.4f}")
-        print(f"  - Val F1-Score: {recall_metrics['f1']:.4f}")
         
         print("\n" + "="*60)
         print(" EVALUATION RESULTS ")
@@ -1124,32 +981,6 @@ def main(mode: str = 'xgboost_smoteenn'):
             X_test, y_test,
             threshold=optimal_threshold,
             dataset_name="TEST (F1-Optimal)"
-        )
-        
-        print("\n" + "="*60)
-        print(" MULTI-THRESHOLD COMPARISON ")
-        print("="*60)
-        
-        test_precision_max = evaluate_model_with_threshold(
-            type('Pipeline', (), {
-                'predict_proba': lambda self, X: final_classifier.predict_proba(
-                    preprocessing_pipeline.transform(X)
-                )
-            })(),
-            X_test, y_test,
-            threshold=precision_threshold,
-            dataset_name="TEST (Precision-Max)"
-        )
-        
-        test_recall_max = evaluate_model_with_threshold(
-            type('Pipeline', (), {
-                'predict_proba': lambda self, X: final_classifier.predict_proba(
-                    preprocessing_pipeline.transform(X)
-                )
-            })(),
-            X_test, y_test,
-            threshold=recall_threshold,
-            dataset_name="TEST (Recall-Max)"
         )
         
         # Add y_true for plotting
@@ -1236,8 +1067,6 @@ def main(mode: str = 'xgboost_smoteenn'):
             'train': {k: v for k, v in train_results.items() if k not in ['y_proba', 'y_true']},
             'val': {k: v for k, v in val_results.items() if k not in ['y_proba', 'y_true']},
             'test_f1_optimal': {k: v for k, v in test_results.items() if k not in ['y_proba', 'y_true']},
-            'test_precision_max': {k: v for k, v in test_precision_max.items() if k not in ['y_proba', 'y_true']},
-            'test_recall_max': {k: v for k, v in test_recall_max.items() if k not in ['y_proba', 'y_true']},
             'training_time_sec': float(training_time),
             'val_test_gap': {
                 'roc_auc': float(val_test_gap_roc),
@@ -1247,14 +1076,6 @@ def main(mode: str = 'xgboost_smoteenn'):
                 'f1_optimal': {
                     'threshold': float(optimal_threshold),
                     'val_metrics': threshold_metrics
-                },
-                'precision_max': {
-                    'threshold': float(precision_threshold),
-                    'val_metrics': precision_metrics
-                },
-                'recall_max': {
-                    'threshold': float(recall_threshold),
-                    'val_metrics': recall_metrics
                 }
             },
             'feature_selection': {
@@ -1281,17 +1102,6 @@ def main(mode: str = 'xgboost_smoteenn'):
         print(f"   Val Recall: {threshold_metrics['recall']:.4f}")
         print(f"   Val F1-Score: {threshold_metrics['f1']:.4f}")
         
-        print("\n2. Precision-Max Strategy (Conservative):")
-        print(f"   Threshold: {precision_threshold:.4f}")
-        print(f"   Val Precision: {precision_metrics['precision']:.4f}")
-        print(f"   Val Recall: {precision_metrics['recall']:.4f}")
-        print(f"   Val F1-Score: {precision_metrics['f1']:.4f}")
-        
-        print("\n3. Recall-Max Strategy (Aggressive):")
-        print(f"   Threshold: {recall_threshold:.4f}")
-        print(f"   Val Precision: {recall_metrics['precision']:.4f}")
-        print(f"   Val Recall: {recall_metrics['recall']:.4f}")
-        print(f"   Val F1-Score: {recall_metrics['f1']:.4f}")
         print("="*60 + "\n")
         
         pipeline = complete_pipeline  # Return complete pipeline
@@ -1302,7 +1112,7 @@ def main(mode: str = 'xgboost_smoteenn'):
     
     elif mode == 'xgboost_fa_smoteenn':
         print("\n" + "="*80)
-        print(" XGBOOST + FIREFLY ALGORITHM + SMOTEENN ")
+        print(" XGBOOST + FIREFLY ALGORITHM (NO SMOTE+ENN) ")
         print("="*80)
         
         print("\nFA Configuration:")
@@ -1338,26 +1148,7 @@ def main(mode: str = 'xgboost_smoteenn'):
         total_features = len(all_features)
         print(f"\nTotal features: {total_features}")
         
-        print("\nApplying SMOTE + ENN (before feature selection)...")
-        print("FA will evaluate features on balanced data")
-        smote = BorderlineSMOTE(
-            random_state=42,
-            k_neighbors=5,
-            sampling_strategy=0.1
-        )
-        enn = EditedNearestNeighbours(
-            n_neighbors=3,
-            sampling_strategy='auto'
-        )
-        
-        X_train_resampled, y_train_resampled = smote.fit_resample(X_train_processed, y_train)
-        X_train_resampled, y_train_resampled = enn.fit_resample(X_train_resampled, y_train_resampled)
-        
-        print(f"  - Original train: {X_train_processed.shape}")
-        print(f"  - After SMOTE+ENN: {X_train_resampled.shape}")
-        print(f"  - Fraud rate: {y_train_resampled.mean():.4f}")
-        
-        print("\nRunning FA Feature Selection on balanced training data...")
+        print("\nRunning FA Feature Selection on imbalanced, encoded data (before resampling)...")
         
         if fa_config is None:
             fa_config = FAConfig()
@@ -1365,12 +1156,11 @@ def main(mode: str = 'xgboost_smoteenn'):
         feature_selector = FeatureSelector(config=fa_config)
         
         # Convert to DataFrame if needed for FA
-        if not isinstance(X_train_resampled, pd.DataFrame):
-            X_train_resampled = pd.DataFrame(X_train_resampled, columns=all_features)
+        if not isinstance(X_train_processed, pd.DataFrame):
+            X_train_processed = pd.DataFrame(X_train_processed, columns=all_features)
         
-        # Fit FA on BALANCED training data
-        X_train_selected = feature_selector.fit_transform(X_train_resampled, y_train_resampled)
-        
+        # Fit FA on ORIGINAL (imbalanced) training data
+        X_train_selected = feature_selector.fit_transform(X_train_processed, y_train)
         selected_features = feature_selector.selected_features_
         
         print(f"\nSelected {len(selected_features)}/{total_features} features")
@@ -1388,6 +1178,24 @@ def main(mode: str = 'xgboost_smoteenn'):
         print(f"  - Train (selected): {X_train_selected.shape}")
         print(f"  - Val (selected): {X_val_selected.shape}")
         print(f"  - Test (selected): {X_test_selected.shape}")
+
+        print("\n[INFO] Training on original imbalanced data (no SMOTE+ENN)")
+        X_train_resampled, y_train_resampled = X_train_selected, y_train
+        print(f"  - Train (selected): {X_train_resampled.shape}")
+        print(f"  - Fraud rate: {y_train_resampled.mean():.4f}")
+
+        # Ensure 2D arrays for XGBoost/Optuna
+        X_train_resampled = np.asarray(X_train_resampled)
+        X_val_selected = np.asarray(X_val_selected)
+        X_test_selected = np.asarray(X_test_selected)
+        if X_train_resampled.ndim == 1:
+            X_train_resampled = X_train_resampled.reshape(-1, 1)
+        if X_val_selected.ndim == 1:
+            X_val_selected = X_val_selected.reshape(-1, 1)
+        if X_test_selected.ndim == 1:
+            X_test_selected = X_test_selected.reshape(-1, 1)
+
+        y_train_resampled = np.asarray(y_train_resampled)
         
         # Check GPU availability
         gpu_available = False
@@ -1403,7 +1211,7 @@ def main(mode: str = 'xgboost_smoteenn'):
         # STEP 4: Optuna hyperparameter tuning (on BALANCED + SELECTED features)
         print("\n[STEP 4] Running Optuna hyperparameter tuning...")
         best_params = tune_xgboost_with_optuna(
-            X_train_selected, y_train_resampled,  # Use BALANCED + SELECTED data
+            X_train_resampled, y_train_resampled,  # Use BALANCED + SELECTED data
             X_val_selected, y_val,
             n_trials=50,
             use_gpu=gpu_available
@@ -1461,7 +1269,7 @@ def main(mode: str = 'xgboost_smoteenn'):
         print(f"  - Training on balanced data with selected features")
         
         final_classifier = XGBClassifier(**best_params)
-        final_classifier.fit(X_train_selected, y_train_resampled)
+        final_classifier.fit(X_train_resampled, y_train_resampled)
         
         training_time = time.time() - start_time
         print(f"\nTraining completed in {training_time:.2f} seconds")
@@ -1470,33 +1278,14 @@ def main(mode: str = 'xgboost_smoteenn'):
         y_val_proba = final_classifier.predict_proba(X_val_selected)[:, 1]
         
         optimal_threshold, best_f1, threshold_metrics = find_optimal_threshold(
-            y_val, y_val_proba, metric='f1'
-        )
-        precision_threshold, _, precision_metrics = find_optimal_threshold(
-            y_val, y_val_proba, metric='precision'
-        )
-        recall_threshold, _, recall_metrics = find_optimal_threshold(
-            y_val, y_val_proba, metric='recall'
+            y_val, y_val_proba
         )
         
-        print(f"\nOptimal thresholds found on validation set:")
-        print(f"\n1. F1-Maximizing Threshold:")
+        print(f"\nOptimal threshold found on validation set (F1-max):")
         print(f"  - Threshold: {optimal_threshold:.4f}")
         print(f"  - Val Precision: {threshold_metrics['precision']:.4f}")
         print(f"  - Val Recall: {threshold_metrics['recall']:.4f}")
         print(f"  - Val F1-Score: {threshold_metrics['f1']:.4f}")
-        
-        print(f"\n2. Precision-Maximizing Threshold (Conservative):")
-        print(f"  - Threshold: {precision_threshold:.4f}")
-        print(f"  - Val Precision: {precision_metrics['precision']:.4f}")
-        print(f"  - Val Recall: {precision_metrics['recall']:.4f}")
-        print(f"  - Val F1-Score: {precision_metrics['f1']:.4f}")
-        
-        print(f"\n3. Recall-Maximizing Threshold (Aggressive):")
-        print(f"  - Threshold: {recall_threshold:.4f}")
-        print(f"  - Val Precision: {recall_metrics['precision']:.4f}")
-        print(f"  - Val Recall: {recall_metrics['recall']:.4f}")
-        print(f"  - Val F1-Score: {recall_metrics['f1']:.4f}")
         
         full_preprocessing = FullPreprocessingPipeline(preprocessing_pipeline, feature_selector)
         
@@ -1535,32 +1324,6 @@ def main(mode: str = 'xgboost_smoteenn'):
             X_test, y_test,
             threshold=optimal_threshold,
             dataset_name="TEST (F1-Optimal)"
-        )
-        
-        print("\n" + "="*60)
-        print(" MULTI-THRESHOLD COMPARISON ")
-        print("="*60)
-        
-        test_precision_max = evaluate_model_with_threshold(
-            type('Pipeline', (), {
-                'predict_proba': lambda self, X: final_classifier.predict_proba(
-                    full_preprocessing.transform(X)
-                )
-            })(),
-            X_test, y_test,
-            threshold=precision_threshold,
-            dataset_name="TEST (Precision-Max)"
-        )
-        
-        test_recall_max = evaluate_model_with_threshold(
-            type('Pipeline', (), {
-                'predict_proba': lambda self, X: final_classifier.predict_proba(
-                    full_preprocessing.transform(X)
-                )
-            })(),
-            X_test, y_test,
-            threshold=recall_threshold,
-            dataset_name="TEST (Recall-Max)"
         )
         
         # Add y_true for plotting
@@ -1650,8 +1413,6 @@ def main(mode: str = 'xgboost_smoteenn'):
             'train': {k: v for k, v in train_results.items() if k not in ['y_proba', 'y_true']},
             'val': {k: v for k, v in val_results.items() if k not in ['y_proba', 'y_true']},
             'test_f1_optimal': {k: v for k, v in test_results.items() if k not in ['y_proba', 'y_true']},
-            'test_precision_max': {k: v for k, v in test_precision_max.items() if k not in ['y_proba', 'y_true']},
-            'test_recall_max': {k: v for k, v in test_recall_max.items() if k not in ['y_proba', 'y_true']},
             'training_time_sec': float(training_time),
             'val_test_gap': {
                 'roc_auc': float(val_test_gap_roc),
@@ -1661,14 +1422,6 @@ def main(mode: str = 'xgboost_smoteenn'):
                 'f1_optimal': {
                     'threshold': float(optimal_threshold),
                     'val_metrics': threshold_metrics
-                },
-                'precision_max': {
-                    'threshold': float(precision_threshold),
-                    'val_metrics': precision_metrics
-                },
-                'recall_max': {
-                    'threshold': float(recall_threshold),
-                    'val_metrics': recall_metrics
                 }
             },
             'feature_selection': {
@@ -1702,17 +1455,6 @@ def main(mode: str = 'xgboost_smoteenn'):
         print(f"   Val Recall: {threshold_metrics['recall']:.4f}")
         print(f"   Val F1-Score: {threshold_metrics['f1']:.4f}")
         
-        print("\n2. Precision-Max Strategy (Conservative):")
-        print(f"   Threshold: {precision_threshold:.4f}")
-        print(f"   Val Precision: {precision_metrics['precision']:.4f}")
-        print(f"   Val Recall: {precision_metrics['recall']:.4f}")
-        print(f"   Val F1-Score: {precision_metrics['f1']:.4f}")
-        
-        print("\n3. Recall-Max Strategy (Aggressive):")
-        print(f"   Threshold: {recall_threshold:.4f}")
-        print(f"   Val Precision: {recall_metrics['precision']:.4f}")
-        print(f"   Val Recall: {recall_metrics['recall']:.4f}")
-        print(f"   Val F1-Score: {recall_metrics['f1']:.4f}")
         print("="*60 + "\n")
         
         pipeline = complete_pipeline
